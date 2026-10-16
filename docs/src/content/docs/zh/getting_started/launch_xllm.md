@@ -80,7 +80,7 @@ do
     --enable_prefix_cache=false \
     --enable_chunked_prefill=false \
     --enable_schedule_overlap=true \
-    --node_rank=$i \ > $LOG_FILE 2>&1 &
+    --node_rank=$i > "$LOG_FILE" 2>&1 &
 done
 ```
 
