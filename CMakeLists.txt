@@ -419,6 +419,12 @@ endif()
 find_package(Python3 COMPONENTS Interpreter Development.Module REQUIRED)
 find_package(pybind11 CONFIG REQUIRED)
 
+if(USE_CUDA AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+  # Prefer libstdc++ filesystem symbols over the copies bundled in libtorch.
+  # PyTorch 2.10 wheels can otherwise call an unresolved weak remove_all helper.
+  link_libraries(stdc++)
+endif()
+
 if (USE_CXX11_ABI)
   # only use jemalloc if using the new C++-11 ABI
   find_package(Jemalloc)
