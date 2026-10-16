@@ -17,76 +17,86 @@ limitations under the License.
 
 #include <gtest/gtest.h>
 
+#include <atomic>
+#include <cstdint>
+
 #include "util/threadpool.h"
 
 namespace xllm {
 
 TEST(BlockingCounterTest, BasicTest) {
-  BlockingCounter counter(1);
+  BlockingCounter counter(/*initial_count=*/1);
   counter.decrement_count();
   counter.wait();
   EXPECT_TRUE(true);
 }
 
 TEST(BlockingCounterTest, TwoThreadTest) {
-  ThreadPool threadpool(1);
-  BlockingCounter counter(2);
+  ThreadPool threadpool(/*num_threads=*/1);
+  BlockingCounter counter(/*initial_count=*/2);
 
-  int called = 0;
+  // Publish each result before signaling completion; increments may overlap.
+  std::atomic<int32_t> called{0};
   threadpool.schedule([&counter, &called]() {
+    called.fetch_add(1, std::memory_order_relaxed);
     counter.decrement_count();
-    ++called;
   });
+  called.fetch_add(1, std::memory_order_relaxed);
   counter.decrement_count();
-  ++called;
   counter.wait();
-  EXPECT_EQ(2, called);
+  EXPECT_EQ(called.load(std::memory_order_relaxed), 2);
 }
 
 TEST(BlockingCounterTest, MultiThreadTest) {
-  ThreadPool threadpool(4);
-  BlockingCounter counter(5);
+  ThreadPool threadpool(/*num_threads=*/4);
+  BlockingCounter counter(/*initial_count=*/5);
 
-  int called = 0;
+  // Publish each result before signaling completion; increments may overlap.
+  std::atomic<int32_t> called{0};
   threadpool.schedule([&counter, &called]() {
+    called.fetch_add(1, std::memory_order_relaxed);
     counter.decrement_count();
-    ++called;
   });
   threadpool.schedule([&counter, &called]() {
+    called.fetch_add(1, std::memory_order_relaxed);
     counter.decrement_count();
-    ++called;
   });
   threadpool.schedule([&counter, &called]() {
+    called.fetch_add(1, std::memory_order_relaxed);
     counter.decrement_count();
-    ++called;
   });
   threadpool.schedule([&counter, &called]() {
+    called.fetch_add(1, std::memory_order_relaxed);
     counter.decrement_count();
-    ++called;
   });
+  called.fetch_add(1, std::memory_order_relaxed);
   counter.decrement_count();
-  ++called;
 
   counter.wait();
-  EXPECT_EQ(5, called);
+  EXPECT_EQ(called.load(std::memory_order_relaxed), 5);
 }
 
 TEST(BlockingCounterTest, WaitTimeoutTest) {
-  ThreadPool threadpool(2);
-  BlockingCounter counter(3);
+  ThreadPool threadpool(/*num_threads=*/2);
+  BlockingCounter counter(/*initial_count=*/3);
+  BlockingCounter completed(/*initial_count=*/1);
 
-  int called = 0;
-  threadpool.schedule([&counter, &called]() {
+  // Publish each result before signaling completion; increments may overlap.
+  std::atomic<int32_t> called{0};
+  threadpool.schedule([&counter, &completed, &called]() {
+    called.fetch_add(1, std::memory_order_relaxed);
     counter.decrement_count();
-    ++called;
+    completed.decrement_count();
   });
 
+  called.fetch_add(1, std::memory_order_relaxed);
   counter.decrement_count();
-  ++called;
 
   const std::chrono::milliseconds timeout(100);
-  counter.wait_for(timeout);
-  EXPECT_EQ(2, called);
+  // The worker has finished, but the intentionally unmatched count remains.
+  completed.wait();
+  EXPECT_FALSE(counter.wait_for(timeout));
+  EXPECT_EQ(called.load(std::memory_order_relaxed), 2);
 }
 
 }  // namespace xllm
