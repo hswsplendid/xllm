@@ -273,8 +273,11 @@ Status TaskExecutionPipeline::validate_input(const LlmForwardInput& source,
        !is_cpu_int_tensor(slots, /*dimensions=*/1)) ||
       params.graph.tiling_data.defined() ||
       params.graph.input_tokens_override.defined() ||
-      params.graph.use_expanded_decode_for_spec_verify_attention ||
-      params.parallel.layer_synchronizer != nullptr) {
+      params.graph.use_expanded_decode_for_spec_verify_attention
+#if defined(USE_NPU) || defined(USE_MLU) || defined(USE_DCU)
+      || params.parallel.layer_synchronizer != nullptr
+#endif
+  ) {
     return Status(
         StatusCode::INVALID_ARGUMENT,
         "Task pipeline requires unpacked CPU input and no graph overrides.");
@@ -664,7 +667,9 @@ Status TaskExecutionPipeline::prepare(uint32_t slot_id,
     }
   }
   slot.buffer->prepare(input, prepare_stream_, padded_batch_size);
+#if defined(USE_NPU) || defined(USE_MLU) || defined(USE_DCU)
   slot.buffer->model_params().parallel.layer_synchronizer.reset();
+#endif
   slot.transfer_kv_infos = input.transfer_kv_infos;
   if (slot.buffer->tokens().numel() != 0) {
     executor_.prepare_attention_metadata(kv_caches_,
@@ -845,7 +850,9 @@ void TaskExecutionPipeline::discard(uint32_t slot_id) {
 }
 
 void TaskExecutionPipeline::release_outputs(Slot& slot) {
+#if defined(USE_NPU) || defined(USE_MLU) || defined(USE_DCU)
   slot.buffer->model_params().parallel.layer_synchronizer.reset();
+#endif
   slot.transfer_kv_infos.clear();
   slot.logits = torch::Tensor();
   slot.model_output = ModelOutput();
