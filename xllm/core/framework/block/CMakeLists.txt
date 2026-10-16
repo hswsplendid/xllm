@@ -17,6 +17,8 @@ cc_library(
     composite_block_manager.cpp
     virtual_memory_kv_cache_block_manager.cpp
   DEPS
+    # Block transfers assign batch IDs through out-of-line batch methods.
+    :batch
     :kv_cache_block
     :kv_transfer_completion
     :kv_cache_memory_interfaces

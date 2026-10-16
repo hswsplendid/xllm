@@ -14,10 +14,8 @@ cc_test(
     glog::glog
     :block
 )
-target_link_libraries(xattention_test
-                      PRIVATE
-                      brpc
-                      "$<LINK_GROUP:RESCAN,cuda_layers,common_layers>")
+# Let CMake scan the full static-library cycle, including runtime and models.
+target_link_libraries(xattention_test PRIVATE brpc)
 
 cc_test(
   NAME
@@ -35,7 +33,4 @@ cc_test(
     GTest::gtest_main
     glog::glog
 )
-target_link_libraries(rwkv7_decoder_layer_test
-                      PRIVATE
-                      brpc
-                      "$<LINK_GROUP:RESCAN,layers,common_layers>")
+target_link_libraries(rwkv7_decoder_layer_test PRIVATE brpc)
