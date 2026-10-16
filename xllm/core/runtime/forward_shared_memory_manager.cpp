@@ -3808,20 +3808,20 @@ bool ForwardSharedMemoryManager::read_token_input(
 #elif defined(USE_MLU)
   materialize_device_buffer = device.type() == torch::kPrivateUse1;
 #endif
-#if defined(USE_NPU)
   if (policy == InputDeviceMaterializationPolicy::DEFER_TO_WORKER_PREPARE) {
+    // Deferred inputs must outlive SHM overwrites and the reader's mapping.
+    materialize_device_buffer = false;
     input.runtime.input_host_buffer =
         torch::empty({static_cast<int64_t>(total_size)},
                      torch::TensorOptions()
                          .dtype(torch::kUInt8)
                          .device(torch::kCPU)
-                         .pinned_memory(/*pinned_memory=*/true));
+                         .pinned_memory(!device.is_cpu()));
     std::memcpy(
         input.runtime.input_host_buffer.data_ptr(), data_ptr, total_size);
     data_ptr =
         static_cast<const char*>(input.runtime.input_host_buffer.data_ptr());
   }
-#endif
   deserialize_forward_input_payload(data_ptr,
                                     total_size,
                                     input,
