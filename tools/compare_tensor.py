@@ -7,19 +7,27 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from scripts.logger import logger
 
 
-def compare_tensors(a: torch.Tensor, b: torch.Tensor, tol: float = 1e-6, verbose: bool = False) -> int:
+def compare_tensors(
+    a: torch.Tensor, b: torch.Tensor, tol: float = 1e-6, verbose: bool = False, rtol: float = 0.0
+) -> int:
     """
-    Compare two PyTorch tensors and count the number of elements whose absolute difference
-    exceeds the given tolerance.
+    Compare two PyTorch tensors and count differing elements.
+
+    Finite values match when abs(a - b) <= tol + rtol * abs(b), with b as
+    the reference. NaN always counts as a difference, including two NaNs at
+    the same position. Infinities match only when they have the same sign;
+    finite/infinite pairs and opposite-sign infinities always differ.
 
     Args:
         a (torch.Tensor): The first tensor to compare.
-        b (torch.Tensor): The second tensor to compare.
+        b (torch.Tensor): The reference tensor to compare against.
         tol (float, optional): The absolute tolerance threshold. Defaults to 1e-6.
         verbose (bool, optional): If True, print the indices and values of differing elements. Defaults to False.
+        rtol (float, optional): The relative tolerance applied to abs(b). Defaults to 0.0,
+            preserving absolute-only comparison for existing calls.
 
     Returns:
-        int: The number of elements where abs(a - b) > tol.
+        int: The number of differing elements under the tolerance and non-finite policies.
 
     Raises:
         ValueError: If the shapes of the input tensors do not match.
@@ -28,8 +36,10 @@ def compare_tensors(a: torch.Tensor, b: torch.Tensor, tol: float = 1e-6, verbose
     if a.shape != b.shape:
         raise ValueError(f"Shape mismatch: {a.shape} vs {b.shape}")
 
-    # Create a boolean mask where differences exceed the tolerance
-    diff_mask = (a - b).abs() > tol
+    # Separate non-finite values so NaN arithmetic cannot hide differences.
+    finite_mask = torch.isfinite(a) & torch.isfinite(b)
+    finite_diff = (a - b).abs() > tol + rtol * b.abs()
+    diff_mask = (finite_mask & finite_diff) | (~finite_mask & (a != b))
 
     # Count the number of differing elements
     diff_count = int(diff_mask.sum().item())
