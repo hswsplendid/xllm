@@ -38,7 +38,13 @@ def compare_tensors(
 
     # Separate non-finite values so NaN arithmetic cannot hide differences.
     finite_mask = torch.isfinite(a) & torch.isfinite(b)
-    finite_diff = (a - b).abs() > tol + rtol * b.abs()
+    difference = a - b
+    # Retain the original scalar threshold for absolute-only comparisons.
+    tolerance = tol
+    if rtol != 0.0:
+        reference = b.to(dtype=difference.dtype)
+        tolerance = tol + rtol * reference.abs()
+    finite_diff = difference.abs() > tolerance
     diff_mask = (finite_mask & finite_diff) | (~finite_mask & (a != b))
 
     # Count the number of differing elements

@@ -294,3 +294,21 @@ def test_relative_and_non_finite_differences_are_counted_together_without_modify
     }
     torch.testing.assert_close(a, original_a, rtol=0.0, atol=0.0, equal_nan=True)
     torch.testing.assert_close(b, original_b, rtol=0.0, atol=0.0, equal_nan=True)
+
+
+@pytest.mark.parametrize("reference_dtype", [torch.float16, torch.bfloat16, torch.float32])
+def test_mixed_dtypes_preserve_default_absolute_tolerance(reference_dtype: torch.dtype) -> None:
+    a = torch.tensor([0.999e-6, 1e-6, 1.001e-6], dtype=torch.float64)
+    b = torch.zeros(3, dtype=reference_dtype)
+
+    assert compare_tensor.compare_tensors(a, b) == 1
+    assert compare_tensor.compare_tensors(a, b, tol=1e-6, rtol=0.0) == 1
+
+
+@pytest.mark.parametrize("reference_dtype", [torch.float16, torch.bfloat16, torch.float32])
+def test_mixed_dtypes_compute_relative_tolerance_in_promoted_dtype(reference_dtype: torch.dtype) -> None:
+    # Keep the tiny absolute contribution when adding it to the relative term.
+    a = torch.tensor([8.5 + 2**-31, 8.5 + 2**-30, 8.5 + 2**-29], dtype=torch.float64)
+    b = torch.full((3,), 8.0, dtype=reference_dtype)
+
+    assert compare_tensor.compare_tensors(a, b, tol=2**-30, rtol=0.0625) == 1
