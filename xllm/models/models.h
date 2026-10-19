@@ -131,6 +131,7 @@ limitations under the License.
 #include "llm/qwen3_5.h"                                // IWYU pragma: keep
 #include "llm/qwen3_moe.h"                              // IWYU pragma: keep
 #include "llm/rwkv7.h"                                  // IWYU pragma: keep
+#include "models/llm/olmo2_registration.h"              // IWYU pragma: keep
 #include "vlm/qwen2_5_vl.h"                             // IWYU pragma: keep
 #include "vlm/qwen2_vl.h"                               // IWYU pragma: keep
 #include "vlm/qwen3_vl.h"                               // IWYU pragma: keep
