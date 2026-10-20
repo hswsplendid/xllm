@@ -213,8 +213,12 @@ class Olmo2DecoderLayer(nn.Module):
 
     def forward(self, hidden: torch.Tensor, cos_half: torch.Tensor, sin_half: torch.Tensor) -> torch.Tensor:
         # Row-parallel projections have already reduced their partial outputs.
-        hidden = hidden + self.post_attention_layernorm(self.self_attn(hidden, cos_half, sin_half))
-        return hidden + self.post_feedforward_layernorm(self.mlp(hidden))
+        # Preserve small post-norm updates across layers in the FP32 residual
+        # stream; projections and attention retain the checkpoint compute dtype.
+        dtype = self.self_attn.qkv_proj.weight.dtype
+        attention = self.self_attn(hidden.to(dtype), cos_half, sin_half)
+        hidden = hidden.float() + self.post_attention_layernorm(attention)
+        return hidden + self.post_feedforward_layernorm(self.mlp(hidden.to(dtype)))
 
     def load_weights(self, weights: ScopedWeightLoader, context: ParallelLoadContext) -> None:
         self.self_attn.load_weights(weights.with_prefix("self_attn."), context)
@@ -244,7 +248,7 @@ class Olmo2Model(nn.Module):
         for i, layer in enumerate(self.layers):
             hidden = layer(hidden, cos_half, sin_half)
             record_layer_event(i)
-        return self.norm(hidden)
+        return self.norm(hidden).to(self.embed_tokens.weight.dtype)
 
 
 def _checkpoint_shapes(cfg: Olmo2Config) -> dict[str, tuple[int, ...]]:
