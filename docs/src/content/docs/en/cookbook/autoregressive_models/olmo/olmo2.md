@@ -118,6 +118,14 @@ For this server's allocator/FFI environment, the successful runs additionally
 set `LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libtcmalloc.so.4` and placed the
 matching Python TVM-FFI `lib` directory first in `LD_LIBRARY_PATH`.
 
+Set `FLASHINFER_OPS_PATH` to the native FlashInfer kernel directory
+(`/flashinfer_ops` in the CUDA image). The service acceptance tool also sends
+unseeded requests with `temperature=0.7`, both regular and streaming, and
+checks completion length and token usage. This exercises the CUDA random
+sampler, which greedy-only checks do not load. Native kernel function lookup
+uses the packed TVM-FFI interface to avoid a C++ `Optional` return-layout
+mismatch when the embedded Python runtime loads a different TVM-FFI version.
+
 ## Tests and measurements
 
 ```bash

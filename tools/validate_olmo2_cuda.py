@@ -284,6 +284,22 @@ def main() -> None:
             assert explicit["choices"][0]["text"] == result["choices"][0]["message"]["content"]
             _save(out / "chat-template-ids.json", chatids)
             _ok("chat-template-and-chat-stream-equivalence")
+
+            # Exercise the CUDA random sampler; greedy requests never load it.
+            sampled_payload = {**_base(ids), "temperature": 0.7}
+            sampled = _request("completion-sampled", sampled_payload)["result"]
+            assert sampled["choices"][0]["text"]
+            assert sampled["choices"][0]["finish_reason"] == "length"
+            assert sampled["usage"]["completion_tokens"] == 12
+            sampled_stream = _request(
+                "completion-sampled-stream",
+                {**sampled_payload, "stream": True, "stream_options": {"include_usage": True}},
+            )
+            assert sampled_stream["result"]["text"]
+            assert sampled_stream["result"]["finish_reason"] == "length"
+            assert sampled_stream["result"]["usage"]["completion_tokens"] == 12
+            _ok("random-sampling-completion-stream-length-usage")
+
             eos = tokenizer.eos_token_id
             for ignore, expected_length, reason in [(False, 1, "stop"), (True, 4, "length")]:
                 r = _request(

@@ -100,6 +100,11 @@ usage。即使完整文本已到达，截断的 chat 流或流内错误也不能
 `LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libtcmalloc.so.4`，并在
 `LD_LIBRARY_PATH` 首位放置配套 Python TVM-FFI 的 `lib` 目录，以匹配本机分配器和 FFI 环境。
 
+还需将 `FLASHINFER_OPS_PATH` 指向 native FlashInfer 内核目录（CUDA 镜像中为 `/flashinfer_ops`）。
+服务工具增加未指定 seed、`temperature=0.7` 的普通与流式请求，检查完成长度和 token 用量，
+覆盖贪心请求不会加载的 CUDA 随机采样内核。native 内核通过 TVM-FFI 打包接口查询函数，
+避免嵌入式 Python 加载不同 TVM-FFI 版本时出现 C++ `Optional` 返回布局不匹配。
+
 ## 测试与性能测量
 
 ```bash
