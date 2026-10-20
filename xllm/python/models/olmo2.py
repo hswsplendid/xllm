@@ -128,7 +128,9 @@ class Olmo2Config:
         ):
             raise ValueError("OLMo2 currently requires unscaled RoPE")
         if rope_parameters:
-            if rope_parameters.get("rope_type", "default") != "default" or rope_parameters.get("factor") is not None:
+            # Transformers prefers rope_type, falling back to the legacy type.
+            rope_type = rope_parameters.get("rope_type", rope_parameters.get("type", "default"))
+            if rope_type != "default" or rope_parameters.get("factor") is not None:
                 raise ValueError("OLMo2 currently requires unscaled RoPE")
         if config.get("layers_to_capture") or config.get("rope_scaling_mrope_section") or config.get("mrope_section"):
             raise ValueError("OLMo2 auxiliary hidden capture and mRoPE are not supported")
