@@ -28,6 +28,32 @@ import requests
 from tools import validate_olmo2_cuda as validation
 
 
+@pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
+@pytest.mark.parametrize("tp", [1, 2])
+def test_loaded_configuration_matches_requested_dtype_and_all_ranks(dtype: str, tp: int) -> None:
+    loaded = [
+        f"Loaded 179 OLMo2 checkpoint tensors; tp_size={tp}, tp_rank={rank}, dtype=torch.{dtype}" for rank in range(tp)
+    ]
+    validation._validate_loaded_configuration(loaded, tp, dtype)
+
+
+@pytest.mark.parametrize("fault", ["dtype", "missing_rank", "duplicate_rank", "wrong_size", "incomplete"])
+def test_loaded_configuration_rejects_incorrect_dtype_or_topology(fault: str) -> None:
+    loaded = [f"tp_rank={rank}, tp_size=2, dtype=torch.bfloat16" for rank in range(2)]
+    if fault == "dtype":
+        loaded[1] = loaded[1].replace("bfloat16", "float16")
+    elif fault == "missing_rank":
+        loaded.pop()
+    elif fault == "duplicate_rank":
+        loaded[1] = loaded[0]
+    elif fault == "wrong_size":
+        loaded[1] = loaded[1].replace("tp_size=2", "tp_size=20")
+    else:
+        loaded[1] = "tp_rank=1, dtype=torch.bfloat16"
+    with pytest.raises(ValueError, match="OLMo2 loaded"):
+        validation._validate_loaded_configuration(loaded, 2, "bfloat16")
+
+
 @pytest.mark.parametrize("architecture", [None, "8.0"])
 def test_launch_preserves_architecture_selection(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, architecture: str | None

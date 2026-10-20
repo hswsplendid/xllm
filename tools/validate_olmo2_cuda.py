@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Validate an OLMo2 FP16 eager HTTP service and optional local baseline."""
+"""Validate an OLMo2 FP16/BF16 eager HTTP service and optional local baseline."""
 
 from __future__ import annotations
 
@@ -20,6 +20,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -55,6 +56,21 @@ def _validate_stream(result: dict[str, Any], events: list[dict[str, Any]], *, in
         raise ValueError("stream ended without the requested usage")
 
 
+def _validate_loaded_configuration(loaded: list[str], tp: int, dtype: str) -> None:
+    """Require one real checkpoint load per expected rank and compute dtype."""
+    observed = []
+    for line in loaded:
+        rank = re.search(r"\btp_rank=(\d+)\b", line)
+        size = re.search(r"\btp_size=(\d+)\b", line)
+        compute_dtype = re.search(r"\bdtype=torch\.(\w+)\b", line)
+        if rank is None or size is None or compute_dtype is None:
+            raise ValueError(f"incomplete OLMo2 loaded configuration: {line}")
+        observed.append((int(rank[1]), int(size[1]), compute_dtype[1]))
+    expected = {(rank, tp, dtype) for rank in range(tp)}
+    if len(observed) != tp or set(observed) != expected:
+        raise ValueError(f"OLMo2 loaded topology/dtype differs: expected={expected}, observed={observed}")
+
+
 def main() -> None:
     if not __debug__:
         raise RuntimeError("OLMo2 validation requires assertions enabled; do not use python -O")
@@ -63,6 +79,12 @@ def main() -> None:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--binary", type=Path, required=True)
+    parser.add_argument(
+        "--dtype",
+        choices=["float16", "bfloat16"],
+        default="float16",
+        help="Expected compute dtype in the model config.",
+    )
     parser.add_argument("--devices", help="Comma-separated physical GPU IDs, one per rank.")
     parser.add_argument("--port", type=int, default=18000)
     parser.add_argument("--benchmark", action="store_true")
@@ -115,6 +137,7 @@ def main() -> None:
             env_overrides=overrides,
             binary_sha256=hashlib.sha256(binary.read_bytes()).hexdigest(),
             build=args.build_label,
+            expected_dtype=args.dtype,
             # Leave architecture detection to FlashInfer unless the caller set it.
             flashinfer_cuda_arch_list=env.get("FLASHINFER_CUDA_ARCH_LIST"),
         ),
@@ -221,12 +244,7 @@ def main() -> None:
                 for line in file.read_text().splitlines()
                 if "Loaded 179 OLMo2 checkpoint tensors" in line
             ]
-            assert len(loaded) == args.tp, loaded
-            for rank in range(args.tp):
-                assert any(
-                    f"tp_rank={rank}" in line and f"tp_size={args.tp}" in line and "dtype=torch.float16" in line
-                    for line in loaded
-                ), loaded
+            _validate_loaded_configuration(loaded, args.tp, args.dtype)
             _save(out / "bridge.json", loaded)
             _ok("models-and-real-configuration")
             ids = tokenizer.encode("Explain in one sentence what an inference engine does.", add_special_tokens=False)
