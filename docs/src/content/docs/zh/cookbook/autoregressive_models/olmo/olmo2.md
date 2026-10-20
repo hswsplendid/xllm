@@ -140,3 +140,46 @@ FP16通过固定原 B06/B07/B08 矩阵，包含真实分页decode、混合batch�
 每rank有13个logits比较超限；新增跨dtype诊断也有失败，均保留在审核证据中。
 FP32残差累加改变低精度舍入，需约定精度契约。支持矩阵暂不修改，待精度评审、
 他人复现及对应平台验收完成后再声明支持。
+
+## 复现完整 checkpoint 数值验收
+
+`tools/validate_olmo2_numerics.py` 使用入库的原 B06/B07 固定输入与原 v2
+预算（`tests/models/fixtures/olmo2/numerics.json`），没有按 xLLM 输出调整
+阈值。模型参数应指向 revision `48d788eca847d4d7548f375ad03d3c9312f6139e`
+的原始 BF16 checkpoint/config；SHA256 校验会拒绝不同权重或配置。
+`--dtype float16` 在内存中转换权重（含次正规数的正常舍入），不改写原模型。
+参考生成要求 Transformers 5.12.1，以未修改的 HF eager BF16 为验收目标，
+另保存 FP32 诊断参考。
+
+```bash
+# Run from a built checkout with its matching xllm_export/runtime environment.
+MODEL=/path/to/OLMo-2-0425-1B-Instruct
+OUT=/path/to/new-validation
+CUDA_VISIBLE_DEVICES=0 python tools/validate_olmo2_numerics.py reference \
+  --model "$MODEL" --output "$OUT/reference"
+CUDA_VISIBLE_DEVICES=0 python tools/validate_olmo2_numerics.py validate \
+  --model "$MODEL" --reference "$OUT/reference" --output "$OUT/fp16-tp1" \
+  --dtype float16
+CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc-per-node=2 \
+  tools/validate_olmo2_numerics.py validate --tp 2 --dtype float16 \
+  --model "$MODEL" --reference "$OUT/reference" --baseline "$OUT/fp16-tp1" \
+  --output "$OUT/fp16-tp2"
+# This is a diagnostic control; a threshold failure deliberately exits 1.
+CUDA_VISIBLE_DEVICES=0 python tools/validate_olmo2_numerics.py hf-control \
+  --model "$MODEL" --reference "$OUT/reference" --output "$OUT/hf-control"
+```
+
+每次使用新输出目录，生成的张量和 manifest 不提交 Git。TP2 要求相同 dtype
+的 TP1 证据，并核对 checkpoint、Python runtime 源码及张量文件 SHA。
+每个权重/分片逐值检查是否精确等于原checkpoint显式dtype转换后的结果，另记录
+转换误差。双 rank 使用真实 xLLM NCCL collective 和 FlashInfer 分页执行，比较 HF、TP1
+及两 rank 的全词表 logits。cache 初值为 NaN，覆盖非单调物理页、127/128/129
+边界、chunked prefill、混合 batch 和总长4096。TP1 有591项比较，TP2 每rank
+有1064项（比原 B08 扩展长序列覆盖）。缺数据、非有限值、形状及数值失败均
+返回非零退出码，报告保留全部失败；TP2 共享失败状态，运行异常直接传播，
+torchrun 负责终止整个 worker group。
+
+将两个验证命令的 dtype 改为 `bfloat16`，并使用不同输出目录，可重跑现存
+BF16 失败。`hf-control` 重跑未修改官方 eager BF16 的 cache/batch 与自身
+full-prefill 参考之间的差异，不据此豁免 xLLM 失败或改变冻结标准。
+自动隔离复现不能代替另一位贡献者的独立审核/复现。

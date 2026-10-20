@@ -161,3 +161,52 @@ diagnostics also have failures, retained in the review evidence. FP32
 residual accumulation changes low-precision rounding and needs an agreed
 precision contract. The supported-model matrix remains unchanged pending
 that review, independent reproduction and platform acceptance.
+
+## Reproduce full-checkpoint numerical acceptance
+
+`tools/validate_olmo2_numerics.py` carries the original B06/B07 inputs and
+unchanged v2 budgets in `tests/models/fixtures/olmo2/numerics.json`. It uses
+the original BF16 checkpoint/config at revision
+`48d788eca847d4d7548f375ad03d3c9312f6139e`; SHA256 checks reject a different
+checkpoint. Pass `--dtype float16` explicitly to convert weights in memory
+(normal FP16 rounding, including subnormal values); the source checkpoint is never rewritten. HF reference
+generation requires Transformers 5.12.1 and compares against unmodified eager
+BF16. FP32 references are diagnostics. No budget is fitted to xLLM output.
+
+```bash
+# Run from a built checkout with its matching xllm_export/runtime environment.
+MODEL=/path/to/OLMo-2-0425-1B-Instruct
+OUT=/path/to/new-validation
+CUDA_VISIBLE_DEVICES=0 python tools/validate_olmo2_numerics.py reference \
+  --model "$MODEL" --output "$OUT/reference"
+CUDA_VISIBLE_DEVICES=0 python tools/validate_olmo2_numerics.py validate \
+  --model "$MODEL" --reference "$OUT/reference" --output "$OUT/fp16-tp1" \
+  --dtype float16
+CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc-per-node=2 \
+  tools/validate_olmo2_numerics.py validate --tp 2 --dtype float16 \
+  --model "$MODEL" --reference "$OUT/reference" --baseline "$OUT/fp16-tp1" \
+  --output "$OUT/fp16-tp2"
+# This is a diagnostic control; a threshold failure deliberately exits 1.
+CUDA_VISIBLE_DEVICES=0 python tools/validate_olmo2_numerics.py hf-control \
+  --model "$MODEL" --reference "$OUT/reference" --output "$OUT/hf-control"
+```
+
+Use new output directories for every run. Keep the generated tensor files and
+manifests outside Git. TP2 requires the same-dtype TP1 evidence and verifies
+checkpoint, runtime source and tensor-file hashes. Every loaded weight/shard is checked exactly against the explicit dtype
+conversion of its checkpoint tensor; conversion error is recorded separately.
+Both ranks use real xLLM
+NCCL collectives and paged FlashInfer execution, compare full vocabulary logits
+against HF/TP1, and check rank equality. Cache starts with NaNs; nonmonotonic
+pages, 127/128/129 boundaries, chunked prefill, mixed batches and total length
+4096 are included. TP1 runs 591 comparisons; TP2 runs 1064 per rank, extending
+the original B08 length coverage. Missing data, non-finite values, shape errors
+and numeric failures cannot produce a successful exit code. Reports preserve
+all failures; TP2 shares a failing status across ranks. Runtime exceptions
+propagate and torchrun terminates the worker group.
+
+Repeat both validation commands with `--dtype bfloat16` and distinct output
+paths to retain the known failures. The `hf-control` command reproduces the
+official eager BF16 cache/batch variation against its own full-prefill reference;
+it does not waive xLLM failures or change the frozen criteria. Actual automated
+reproduction is distinct from review/reproduction by another contributor.
