@@ -139,8 +139,12 @@ using reported completion tokens, including invisible special tokens. It is
 a client metric, not an individual kernel or token-arrival measurement.
 Record other GPU users and cache pressure before interpreting throughput.
 
-The current local native build uses `XLLM_DEV_MODE=ON` (O1). Its measurements
+The historical local native build used `XLLM_DEV_MODE=ON` (O1). Its measurements
 are development baselines, not release performance or a speedup claim.
+The October 20–21 revalidation used matching Release/O3 native and Python
+artifacts after rebasing onto main `b6123035`. Its HTTP timing runs overlapped
+CPU compilation of the repository tests, so they are diagnostic measurements,
+not a controlled release benchmark.
 
 
 The local development run used two RTX 4090 devices reporting 48537 MiB each.
@@ -177,12 +181,14 @@ post-optimization speedup is claimed.
 BF16 and FP16 each pass 591 TP1 checks and 1064 checks on each of two real
 NCCL ranks, using unchanged frozen budgets and HF BF16 references. Each
 dtype also passes six HTTP functional groups and six benchmark conditions
-with three repetitions for both TP configurations. BF16 TP2 numerical
-validation used 64 physical cache pages after shared-GPU OOMs with 80; all
-inputs, lengths and checks were retained. Shared-GPU TP2 services used
-`--max-memory-utilization 0.99 --max-cache-size 536870912`; TP1 retained the
-default configuration. Earlier numerical and resource failures remain in
-the contribution evidence. These are development results on this setup.
+with three repetitions for both TP configurations. Revalidation on main
+`b6123035` with matching Release/O3 artifacts passed this complete matrix
+using 80 physical cache pages for numerical tests and the HTTP tool defaults
+of `--max-memory-utilization 0.4 --max-cache-size 1073741824` for every rank.
+Both GPUs were available when these numerical runs started. Earlier shared-GPU
+runs needed 64 pages and a smaller HTTP cache cap; those resource failures and
+successful retries remain in the contribution evidence. These results apply
+to this local CUDA setup and do not establish a performance improvement.
 The mixed-precision policy still needs maintainer review and independent
 reproduction. The supported-model matrix remains unchanged.
 
