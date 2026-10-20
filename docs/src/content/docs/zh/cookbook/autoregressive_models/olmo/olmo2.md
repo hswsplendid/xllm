@@ -11,6 +11,7 @@ sidebar:
 FlashInfer 分页 attention、FP16、eager、TP=1/2。依赖 OLMo2 C++ 配置
 加载前置 Z25（PR #2518）。当前不是完整平台支持声明；NPU、量化、图执行
 以及大于1的 DP/CP/PP 尚未完成本模型验收。
+本次贡献目标为 NVIDIA CUDA；Ascend 适配是后续独立任务。
 
 模型为16层、hidden2048、16个128维 MHA head、intermediate8192、vocab100352、
 context4096。Q/K RMSNorm 在 reshape head 和 RoPE 前覆盖完整投影维度；
@@ -74,6 +75,12 @@ python tools/validate_olmo2_cuda.py \
 可见两卡不会自动形成 TP=2。工具核对实际加载的 TP/dtype、模板 token 数、
 流式一致性、EOS/ignore_eos、stop token/string、长度、错误输入及混合并发隔离。
 这些属于服务验收，不能代替 logits 数值对照。
+所有流式响应必须带有结束原因并以 `[DONE]` 结束，请求了 usage 时还必须返回
+usage。即使完整文本已到达，截断的 chat 流或流内错误也不能通过验收。
+
+工具保留调用者设置的 `FLASHINFER_CUDA_ARCH_LIST`；未设置时由 FlashInfer
+检测 GPU 架构，不会将 RTX4090 的架构强制应用到其他 NVIDIA GPU。
+`launch.json` 记录实际架构覆盖值；其他型号仍需实机验证。
 
 本机成功命令额外设置
 `LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libtcmalloc.so.4`，并在
@@ -83,7 +90,7 @@ python tools/validate_olmo2_cuda.py \
 
 ```bash
 python -m pytest tests/python/test_olmo2.py tests/python/test_registry.py \
-  tests/python/test_flashinfer_attention.py -q
+  tests/python/test_flashinfer_attention.py tests/python/test_validate_olmo2_cuda.py -q
 
 python tools/validate_olmo2_cuda.py \
   --model "$OLMO2_FP16" --binary "$XLLM_BINARY" \
