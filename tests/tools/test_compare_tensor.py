@@ -159,6 +159,7 @@ def test_empty_tensors_return_zero_without_logging(shape: tuple[int, ...]) -> No
 
 
 def test_verbose_supports_non_contiguous_tensors_without_modifying_inputs() -> None:
+    """Log complete coordinates for non-contiguous inputs without modifying them."""
     a = torch.zeros((2, 3, 4)).transpose(0, 2)
     b = a.clone()
     a[3, 2, 1] = 1.5
@@ -178,6 +179,7 @@ def test_verbose_supports_non_contiguous_tensors_without_modifying_inputs() -> N
 
 
 def test_default_relative_tolerance_is_zero() -> None:
+    """Keep relative tolerance disabled unless the caller explicitly enables it."""
     a = torch.tensor([1_000_000.25], dtype=torch.float64)
     b = torch.tensor([1_000_000.0], dtype=torch.float64)
 
@@ -187,6 +189,7 @@ def test_default_relative_tolerance_is_zero() -> None:
 
 
 def test_legacy_positional_tolerance_and_verbose_are_preserved() -> None:
+    """Preserve the original positional tolerance and verbose arguments."""
     a = torch.zeros(2, dtype=torch.float64)
     b = torch.tensor([0.125, 0.25], dtype=torch.float64)
 
@@ -200,6 +203,7 @@ def test_legacy_positional_tolerance_and_verbose_are_preserved() -> None:
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32, torch.float64])
 def test_combined_tolerance_includes_boundary_and_uses_absolute_reference(dtype: torch.dtype) -> None:
+    """Accept equality at the combined threshold for positive, negative and zero references."""
     # Binary fractions keep below/equal/above cases exact in every tested dtype.
     a = torch.tensor([8.75, 9.0, 9.25, -8.75, -9.0, -9.25, 0.25, 0.5, 0.75], dtype=dtype)
     b = torch.tensor([8.0, 8.0, 8.0, -8.0, -8.0, -8.0, 0.0, 0.0, 0.0], dtype=dtype)
@@ -211,6 +215,7 @@ def test_combined_tolerance_includes_boundary_and_uses_absolute_reference(dtype:
 
 
 def test_relative_tolerance_can_be_used_without_absolute_tolerance() -> None:
+    """Apply a purely relative threshold while still detecting errors against zero."""
     a = torch.tensor([9.0, -9.0, 0.125], dtype=torch.float64)
     b = torch.tensor([8.0, -8.0, 0.0], dtype=torch.float64)
 
@@ -218,6 +223,7 @@ def test_relative_tolerance_can_be_used_without_absolute_tolerance() -> None:
 
 
 def test_second_tensor_is_the_relative_tolerance_reference() -> None:
+    """Use the second tensor as the reference for asymmetric relative comparisons."""
     a = torch.tensor([1.0], dtype=torch.float64)
     b = torch.tensor([2.0], dtype=torch.float64)
 
@@ -247,6 +253,7 @@ def test_second_tensor_is_the_relative_tolerance_reference() -> None:
     ],
 )
 def test_non_finite_comparison_policy(a_value: float, b_value: float, expected_count: int, rtol: float) -> None:
+    """Count NaNs and unequal infinities independently of the relative tolerance."""
     a = torch.tensor([a_value], dtype=torch.float64)
     b = torch.tensor([b_value], dtype=torch.float64)
 
@@ -258,6 +265,7 @@ def test_non_finite_comparison_policy(a_value: float, b_value: float, expected_c
 
 @pytest.mark.parametrize("verbose", [False, True])
 def test_default_non_finite_policy_counts_and_logs_only_differences(verbose: bool) -> None:
+    """Count and optionally log only mismatches under the default non-finite policy."""
     a = torch.tensor([[float("nan"), float("inf")], [-float("inf"), 1.0]])
     b = torch.tensor([[float("nan"), float("inf")], [float("inf"), float("nan")]])
 
@@ -276,6 +284,7 @@ def test_default_non_finite_policy_counts_and_logs_only_differences(verbose: boo
 
 
 def test_relative_and_non_finite_differences_are_counted_together_without_modifying_inputs() -> None:
+    """Combine relative and non-finite mismatches without changing either input tensor."""
     a = torch.tensor([[[9.0, 9.25, float("nan"), float("inf"), 1.0, -float("inf")]]], dtype=torch.float64)
     b = torch.tensor([[[8.0, 8.0, float("nan"), float("inf"), float("inf"), float("inf")]]], dtype=torch.float64)
     original_a = a.clone()
@@ -298,6 +307,7 @@ def test_relative_and_non_finite_differences_are_counted_together_without_modify
 
 @pytest.mark.parametrize("reference_dtype", [torch.float16, torch.bfloat16, torch.float32])
 def test_mixed_dtypes_preserve_default_absolute_tolerance(reference_dtype: torch.dtype) -> None:
+    """Preserve the absolute threshold when the reference has a lower precision."""
     a = torch.tensor([0.999e-6, 1e-6, 1.001e-6], dtype=torch.float64)
     b = torch.zeros(3, dtype=reference_dtype)
 
@@ -307,8 +317,52 @@ def test_mixed_dtypes_preserve_default_absolute_tolerance(reference_dtype: torch
 
 @pytest.mark.parametrize("reference_dtype", [torch.float16, torch.bfloat16, torch.float32])
 def test_mixed_dtypes_compute_relative_tolerance_in_promoted_dtype(reference_dtype: torch.dtype) -> None:
+    """Retain small absolute contributions in mixed-dtype relative thresholds."""
     # Keep the tiny absolute contribution when adding it to the relative term.
     a = torch.tensor([8.5 + 2**-31, 8.5 + 2**-30, 8.5 + 2**-29], dtype=torch.float64)
     b = torch.full((3,), 8.0, dtype=reference_dtype)
 
     assert compare_tensor.compare_tensors(a, b, tol=2**-30, rtol=0.0625) == 1
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32, torch.float64])
+@pytest.mark.parametrize(
+    "reference_value",
+    [1_000_000, -1_000_000, torch.iinfo(torch.int64).min, torch.iinfo(torch.int64).max],
+    ids=["positive-large", "negative-large", "int64-min", "int64-max"],
+)
+@pytest.mark.parametrize(
+    ("rtol", "expected_count"),
+    [(1e-6, 1), (0.5, 1), (1.0, 0), (2.0, 0)],
+    ids=["small-tolerance", "below-boundary", "at-boundary", "above-boundary"],
+)
+def test_large_integral_references_use_finite_relative_thresholds(
+    dtype: torch.dtype, reference_value: int, rtol: float, expected_count: int
+) -> None:
+    """Compare large signed integers without overflowing the difference or threshold."""
+    a = torch.zeros(1, dtype=dtype)
+    b = torch.tensor([reference_value], dtype=torch.int64)
+    original_a = a.clone()
+    original_b = b.clone()
+
+    count = compare_tensor.compare_tensors(a, b, tol=0.0, rtol=rtol)
+
+    assert type(count) is int
+    assert count == expected_count
+    assert torch.equal(a, original_a)
+    assert torch.equal(b, original_b)
+
+
+def test_verbose_reports_finite_differences_for_large_integral_references() -> None:
+    """Log promoted finite differences for every large integral reference mismatch."""
+    a = torch.zeros(2, dtype=torch.float16)
+    b = torch.tensor([1_000_000, -1_000_000], dtype=torch.int64)
+
+    with patch.object(compare_tensor.logger, "info") as log_info:
+        count = compare_tensor.compare_tensors(a, b, verbose=True, rtol=1e-6)
+
+    assert count == 2
+    assert [entry.args[0] for entry in log_info.call_args_list] == [
+        "diff at 0: 0.000000 - 1000000.000000 = -1000000.000000",
+        "diff at 1: 0.000000 - -1000000.000000 = 1000000.000000",
+    ]

@@ -17,6 +17,8 @@ def compare_tensors(
     the reference. NaN always counts as a difference, including two NaNs at
     the same position. Infinities match only when they have the same sign;
     finite/infinite pairs and opposite-sign infinities always differ.
+    With relative tolerance enabled, integral references are promoted to at
+    least float64 before computing differences and thresholds.
 
     Args:
         a (torch.Tensor): The first tensor to compare.
@@ -38,11 +40,17 @@ def compare_tensors(
 
     # Separate non-finite values so NaN arithmetic cannot hide differences.
     finite_mask = torch.isfinite(a) & torch.isfinite(b)
-    difference = a - b
     # Retain the original scalar threshold for absolute-only comparisons.
-    tolerance = tol
-    if rtol != 0.0:
-        reference = b.to(dtype=difference.dtype)
+    if rtol == 0.0:
+        difference = a - b
+        tolerance = tol
+    else:
+        comparison_dtype = torch.promote_types(a.dtype, b.dtype)
+        # Integral references must stay finite, even with low-precision inputs.
+        if not (b.is_floating_point() or b.is_complex()):
+            comparison_dtype = torch.promote_types(comparison_dtype, torch.float64)
+        reference = b.to(dtype=comparison_dtype)
+        difference = a.to(dtype=comparison_dtype) - reference
         tolerance = tol + rtol * reference.abs()
     finite_diff = difference.abs() > tolerance
     diff_mask = (finite_mask & finite_diff) | (~finite_mask & (a != b))
@@ -58,8 +66,8 @@ def compare_tensors(
             coordinate_text = ",".join(str(value) for value in coordinate)
             a_value = a[coordinate].item()
             b_value = b[coordinate].item()
-            difference = (a[coordinate] - b[coordinate]).item()
-            logger.info(f"diff at {coordinate_text}: {a_value:.6f} - {b_value:.6f} = {difference:.6f}")
+            difference_value = difference[coordinate].item()
+            logger.info(f"diff at {coordinate_text}: {a_value:.6f} - {b_value:.6f} = {difference_value:.6f}")
 
     return diff_count
 
