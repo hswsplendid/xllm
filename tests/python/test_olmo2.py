@@ -290,6 +290,35 @@ def test_cuda_model_matches_tiny_transformers_at_nonzero_positions() -> None:
     assert model.model.rotary.cos_sin_cache.dtype == torch.float32
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="OLMo2 residual precision test requires a GPU")
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_small_post_norm_updates_survive_repeated_residual_additions(dtype: torch.dtype) -> None:
+    device = torch.device("cuda:0")
+    model = Olmo2ForCausalLM(_config(device=str(device), dtype=dtype)).eval()
+    layer = model.model.layers[0]
+    with torch.no_grad():
+        for parameter in layer.parameters():
+            parameter.zero_()
+        # A positive, uniform MLP output normalizes to gamma, independently of
+        # its magnitude. Each layer should retain an approximately 0.001 update.
+        layer.mlp.gate_up_proj.weight.fill_(0.125)
+        layer.mlp.down_proj.weight.fill_(1 / 24)
+        layer.post_feedforward_layernorm.weight.fill_(0.001)
+    hidden = torch.ones(2, 16, dtype=dtype, device=device)
+    cos = torch.ones(2, 2, device=device)
+    sin = torch.zeros_like(cos)
+    context = ForwardContext(
+        attention_backend=cast(AttentionBackend, _DenseAttentionBackend()),
+        device=device,
+        metadata=cast(AttentionMetadata, SimpleNamespace()),
+        layer_caches=[],
+    )
+    with torch.inference_mode(), forward_context(context):
+        for _ in range(8):
+            hidden = layer(hidden, cos, sin)
+    torch.testing.assert_close(hidden.float(), torch.full_like(hidden.float(), 1.008), rtol=0, atol=2e-5)
+
+
 class _PagedModelRunner:
     """Drive the production FlashInfer backend with disjoint request pages."""
 
