@@ -659,6 +659,93 @@ def test_overflow_comparison_preserves_exact_boundary_and_adjacent_values(
     assert compare_tensor.compare_tensors(a, b, tol=8.988465674311576e307, rtol=1.5) == expected_count
 
 
+@pytest.mark.parametrize("sign", [-1, 1])
+@pytest.mark.parametrize("actual", [-1.0, 0.0, 1.0])
+@pytest.mark.parametrize("rtol", [math.nextafter(1.0, 0.0), 1.0, math.nextafter(1.0, math.inf)])
+def test_float64_rounded_deltas_preserve_exact_relative_boundaries(sign: int, actual: float, rtol: float) -> None:
+    """Retain finite discrepancies rounded away by float64 subtraction near a relative boundary."""
+    actual *= sign
+    reference = float(sign * 2**53)
+    expected = int(abs(Fraction(actual) - Fraction(reference)) > Fraction(rtol) * abs(Fraction(reference)))
+    a = torch.tensor([actual], dtype=torch.float64)
+    b = torch.tensor([reference], dtype=torch.float64)
+
+    assert compare_tensor.compare_tensors(a, b, tol=0.0, rtol=rtol) == expected
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32, torch.float64])
+@pytest.mark.parametrize(
+    ("actual", "reference", "tol", "rtol"),
+    [
+        (0.0, 3.0, 1.0, 2.0 / 3.0),
+        (0.0, 1.0, math.nextafter(1.0, 0.0), 2.0**-54),
+        (0.0, 1.0, math.nextafter(1.0, math.inf), -(2.0**-53)),
+        (1.0, 1.0, -(2.0**-54), 2.0**-55),
+    ],
+    ids=["rounded-product", "rounded-addition", "negative-relative", "negative-threshold"],
+)
+def test_rounded_relative_thresholds_agree_with_exact_fractions(
+    dtype: torch.dtype, actual: float, reference: float, tol: float, rtol: float
+) -> None:
+    """Account for multiplication and addition rounding even when low-precision deltas are exact."""
+    expected = int(
+        abs(Fraction(actual) - Fraction(reference)) > Fraction(tol) + Fraction(rtol) * abs(Fraction(reference))
+    )
+    a, b = torch.tensor([actual], dtype=dtype), torch.tensor([reference], dtype=dtype)
+
+    assert compare_tensor.compare_tensors(a, b, tol=tol, rtol=rtol) == expected
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32, torch.float64])
+@pytest.mark.parametrize("reverse", [False, True])
+def test_mixed_floating_dtypes_preserve_deltas_below_float64_resolution(dtype: torch.dtype, reverse: bool) -> None:
+    """Detect a unit discrepancy at a large reference across both floating operand orders."""
+    a = torch.tensor([-1.0], dtype=dtype)
+    b = torch.tensor([2.0**60], dtype=torch.float64)
+    if reverse:
+        a, b = b, a
+
+    assert compare_tensor.compare_tensors(a, b, tol=0.0, rtol=1.0) == 1
+
+
+@pytest.mark.parametrize("sign", [-1, 1])
+def test_subnormal_relative_boundary_uses_exact_values(sign: int) -> None:
+    """Retain a discrepancy when an underflowing relative product rounds up to the exact delta."""
+    smallest = math.ulp(0.0)
+    a = torch.tensor([-sign * smallest], dtype=torch.float64)
+    b = torch.tensor([sign * smallest], dtype=torch.float64)
+
+    assert compare_tensor.compare_tensors(a, b, tol=0.0, rtol=1.5) == 1
+
+
+@pytest.mark.parametrize("dtype", [torch.complex64, torch.complex128])
+@pytest.mark.parametrize("rotation", [1.0, -1.0, 1j, -1j])
+@pytest.mark.parametrize(("direction", "expected"), [(-1, 1), (0, 0), (1, 0)])
+def test_complex_rounded_magnitudes_preserve_exact_relative_boundaries(
+    dtype: torch.dtype, rotation: complex, direction: int, expected: int
+) -> None:
+    """Classify both sides of an exact complex norm boundary even when the rounded norms coincide."""
+    a = torch.tensor([rotation * direction * 2.0**-80], dtype=dtype)
+    b = torch.tensor([rotation * (1 + 1j)], dtype=dtype)
+
+    assert compare_tensor.compare_tensors(a, b, tol=0.0, rtol=1.0) == expected
+
+
+@pytest.mark.parametrize("rotation", [1.0, -1.0, 1j, -1j])
+def test_complex_norm_rounding_does_not_report_spurious_differences(rotation: complex) -> None:
+    """Accept an exact in-tolerance complex pair whose independently rounded norms suggest a difference."""
+    actual = rotation * complex(-5.218365018639276e-31, 1.4574018762342288e-30)
+    reference = rotation * complex(-2.0873460074557104e-31, 5.829607504936915e-31)
+    delta_squared = (Fraction(actual.real) - Fraction(reference.real)) ** 2 + (
+        Fraction(actual.imag) - Fraction(reference.imag)
+    ) ** 2
+    reference_squared = Fraction(reference.real) ** 2 + Fraction(reference.imag) ** 2
+    assert delta_squared <= Fraction(1.5) ** 2 * reference_squared
+    a, b = torch.tensor([actual], dtype=torch.complex128), torch.tensor([reference], dtype=torch.complex128)
+
+    assert compare_tensor.compare_tensors(a, b, tol=0.0, rtol=1.5) == 0
+
+
 @pytest.mark.parametrize("dtype", [torch.int8, torch.int16, torch.int32, torch.int64, torch.uint8, torch.bool])
 @pytest.mark.parametrize(
     "tol", [0.0, 0.5, 1.0, 1.5, 2**63 - 1024, 2**63, 2**64 - 2048, -1.0, math.inf, -math.inf, math.nan]

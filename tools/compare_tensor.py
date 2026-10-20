@@ -165,30 +165,51 @@ def _integral_difference_mask(a: torch.Tensor, b: torch.Tensor, tol: float, rtol
     return differences
 
 
+def _magnitude_bounds(value: torch.Tensor, rounded_components: bool) -> tuple[torch.Tensor, torch.Tensor]:
+    """Enclose a magnitude, including component subtraction rounding and complex norm arithmetic."""
+    if not value.is_complex():
+        magnitude = value.abs()
+        if not rounded_components:
+            return magnitude, magnitude
+        lower = torch.nextafter(magnitude, torch.full_like(magnitude, -math.inf)).clamp(min=0)
+        upper = torch.nextafter(magnitude, torch.full_like(magnitude, math.inf))
+        return lower, upper
+
+    real_lower, real_upper = _magnitude_bounds(value.real, rounded_components)
+    imag_lower, imag_upper = _magnitude_bounds(value.imag, rounded_components)
+    negative_inf, positive_inf = torch.full_like(real_lower, -math.inf), torch.full_like(real_lower, math.inf)
+    # Bound each operation separately so cancellation, subnormal values and overflowing
+    # squares remain enclosed without depending on the accuracy of a complex abs kernel.
+    lower = torch.nextafter(real_lower.square(), negative_inf).clamp(min=0)
+    lower = lower + torch.nextafter(imag_lower.square(), negative_inf).clamp(min=0)
+    lower = torch.nextafter(lower, negative_inf).clamp(min=0)
+    upper = torch.nextafter(real_upper.square(), positive_inf) + torch.nextafter(imag_upper.square(), positive_inf)
+    upper = torch.nextafter(upper, positive_inf)
+    return torch.nextafter(lower.sqrt(), negative_inf).clamp(min=0), torch.nextafter(upper.sqrt(), positive_inf)
+
+
 def _relative_difference_mask(a: torch.Tensor, b: torch.Tensor, tol: float, rtol: float) -> torch.Tensor:
-    """Widen one floating chunk and compare finite overflow candidates with exact arithmetic."""
+    """Widen one floating chunk and resolve overlapping rounding bounds with exact arithmetic."""
     comparison_dtype = torch.promote_types(torch.promote_types(a.dtype, b.dtype), torch.float64)
     actual = a.to(dtype=comparison_dtype)
     reference = b.to(dtype=comparison_dtype)
     if not (math.isfinite(tol) and math.isfinite(rtol)):
         return _non_finite_tolerance_mask(reference, tol, rtol)
-    difference = (actual - reference).abs()
-    reference_magnitude = reference.abs()
-    relative_threshold = rtol * reference_magnitude
-    differences = difference > tol + relative_threshold
-    # Low-precision inputs usually cannot overflow float64. Proving that from their
-    # dtype limits avoids synchronizing CUDA to inspect an empty candidate mask.
-    largest = max(torch.finfo(a.dtype).max, torch.finfo(b.dtype).max)
-    magnitude_bound = largest * (2 if a.is_complex() or b.is_complex() else 1)
-    if math.isfinite(2 * magnitude_bound) and math.isfinite(rtol * magnitude_bound):
-        return differences
-    overflow = (
-        torch.isfinite(actual)
-        & torch.isfinite(reference)
-        & (torch.isinf(difference) | torch.isinf(reference_magnitude) | torch.isinf(relative_threshold))
-    )
-    if overflow.any():
-        differences[overflow] = _exact_difference_mask(a[overflow], b[overflow], tol, rtol)
+    delta_lower, delta_upper = _magnitude_bounds(actual - reference, rounded_components=True)
+    reference_lower, reference_upper = _magnitude_bounds(reference, rounded_components=False)
+    if rtol < 0:
+        reference_lower, reference_upper = reference_upper, reference_lower
+    negative_inf, positive_inf = torch.full_like(delta_lower, -math.inf), torch.full_like(delta_lower, math.inf)
+    # Include rounding in both the multiplication and addition, not only subtraction.
+    lower = torch.nextafter(tol + torch.nextafter(rtol * reference_lower, negative_inf), negative_inf)
+    upper = torch.nextafter(tol + torch.nextafter(rtol * reference_upper, positive_inf), positive_inf)
+    differences = delta_lower > upper
+    uncertain = torch.isfinite(actual) & torch.isfinite(reference) & ~((delta_upper <= lower) | differences)
+    if tol >= 0 and rtol >= 0:
+        # Exact matches need no host arithmetic, even when zero bounds overlap.
+        uncertain &= actual != reference
+    if uncertain.any():
+        differences[uncertain] = _exact_difference_mask(a[uncertain], b[uncertain], tol, rtol)
     return differences
 
 
@@ -256,7 +277,8 @@ def compare_tensors(
     the same position. Infinities match only when they have the same sign;
     finite/infinite pairs and opposite-sign infinities always differ.
     Comparisons run in bounded chunks. Relative floating comparisons use at
-    least float64, with exact arithmetic for finite overflow candidates. Integral
+    least float64, with exact arithmetic when rounding bounds overlap, including
+    finite overflow and underflow candidates. Integral
     pairs use vectorized overflow-safe comparisons, with exact host arithmetic
     for precision-sensitive relative candidates, including mixed real/integral
     pairs. Mixed complex/integral pairs use exact host arithmetic when rtol is
