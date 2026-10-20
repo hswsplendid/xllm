@@ -147,7 +147,9 @@ REGISTER_MODEL_ARGS_LOADER(olmo2, [](const JsonReader& json, ModelArgs* args) {
   const auto* rope_parameters = json.resolve("rope_parameters");
   if (rope_parameters != nullptr && !rope_parameters->is_null()) {
     std::string rope_type = "default";
+    // Match Transformers: the canonical rope_type overrides the legacy type.
     if (!rope_parameters->is_object() ||
+        !read("rope_parameters.type", &rope_type) ||
         !read("rope_parameters.rope_type", &rope_type) ||
         rope_type != "default" ||
         (rope_parameters->contains("factor") &&
