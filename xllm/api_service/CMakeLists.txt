@@ -110,6 +110,10 @@ cc_library(
     $<$<BOOL:${USE_NPU}>:torch_npu>
 )
 
+# The api_service/master/distributed_runtime cycle introduces parser references
+# on its second archive scan; a third scan resolves the PD response symbols.
+set_target_properties(api_service PROPERTIES LINK_INTERFACE_MULTIPLICITY 3)
+
 # Request-path hop 1: JSON -> proto -> RequestParams, response proto -> JSON.
 cc_binary(
   NAME
