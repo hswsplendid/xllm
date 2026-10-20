@@ -30,7 +30,7 @@ from transformers.models.olmo2.modeling_olmo2 import Olmo2RMSNorm as HfOlmo2RMSN
 from xllm import xllm_export
 from xllm.pybind.utils import _infer_model_type_and_backend
 from xllm.python import distributed, registry
-from xllm.python.attention.backend import AttentionBackend, AttentionMetadata
+from xllm.python.attention.backend import AttentionBackend, AttentionMetadata, LayerCache
 from xllm.python.layers.attention import Attention
 from xllm.python.model_executor.forward_context import ForwardContext, forward_context
 from xllm.python.models.olmo2 import Olmo2Attention, Olmo2Config, Olmo2ForCausalLM, Olmo2RMSNorm
@@ -288,6 +288,154 @@ def test_cuda_model_matches_tiny_transformers_at_nonzero_positions() -> None:
         actual = model.compute_logits(model.model(tokens, positions), None)
     torch.testing.assert_close(actual, expected, rtol=2e-5, atol=2e-6)
     assert model.model.rotary.cos_sin_cache.dtype == torch.float32
+
+
+class _PagedModelRunner:
+    """Drive the production FlashInfer backend with disjoint request pages."""
+
+    def __init__(self, model: Olmo2ForCausalLM) -> None:
+        from xllm.python.attention.flashinfer import FlashInferBackend
+
+        self.model = model
+        self.block_size = 128
+        attention = model.model.layers[0].self_attn.attn
+        self.backend = FlashInferBackend(
+            attention.num_heads,
+            attention.num_kv_heads,
+            attention.head_dim,
+            attention.scale,
+            0,
+            model.device,
+            model.dtype,
+        )
+        shape = (8, self.block_size, attention.num_kv_heads, attention.head_dim)
+        self.caches = [
+            LayerCache(
+                key=torch.full(shape, float("nan"), dtype=model.dtype, device=model.device),
+                value=torch.full(shape, float("nan"), dtype=model.dtype, device=model.device),
+            )
+            for _ in model.model.layers
+        ]
+        self.backend.bind_kv_caches(self.caches)
+
+    def run(
+        self, queries: list[list[int]], past: list[int], pages: list[list[int]], *, chunked: bool = False
+    ) -> torch.Tensor:
+        totals = [n + len(query) for n, query in zip(past, queries, strict=True)]
+        slots, positions, indices, indptr, qo = [], [], [], [0], [0]
+        for query, n, total, request_pages in zip(queries, past, totals, pages, strict=True):
+            slots.extend(
+                request_pages[i // self.block_size] * self.block_size + i % self.block_size for i in range(n, total)
+            )
+            positions.extend(range(n, total))
+            indices.extend(request_pages[: (total + self.block_size - 1) // self.block_size])
+            indptr.append(len(indices))
+            qo.append(qo[-1] + len(query))
+
+        def _tensor(values: list[int]) -> torch.Tensor:
+            return torch.tensor(values, dtype=torch.int32, device=self.model.device)
+
+        metadata = cast(
+            AttentionMetadata,
+            SimpleNamespace(
+                is_prefill=not any(past),
+                is_chunked_prefill=chunked,
+                slot_mapping=_tensor(slots),
+                q_cu_seq_lens=_tensor(qo),
+                kv_cu_seq_lens=_tensor(qo),
+                qo_indptr=_tensor(qo),
+                paged_kv_indptr=_tensor(indptr),
+                paged_kv_indices=_tensor(indices),
+                paged_kv_last_page_len=_tensor([(n - 1) % self.block_size + 1 for n in totals]),
+                prepared_attention_state=None,
+            ),
+        )
+        self.backend.prepare(metadata)
+        tokens = torch.tensor([token for query in queries for token in query], device=self.model.device)
+        position_ids = torch.tensor(positions, device=self.model.device)
+        selected = torch.tensor([end - 1 for end in qo[1:]], device=self.model.device)
+        context = ForwardContext(self.backend, self.model.device, metadata, self.caches)
+        with torch.inference_mode(), forward_context(context):
+            return self.model.compute_logits(self.model.model(tokens, position_ids), selected)
+
+
+def _cached_cuda_models() -> tuple[Olmo2ForCausalLM, HfOlmo2ForCausalLM]:
+    torch.manual_seed(20261020)
+    config = _config(
+        hidden_size=256,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        head_dim=128,
+        intermediate_size=512,
+        max_position_embeddings=256,
+        dtype="float16",
+        device="cuda:0",
+    )
+    hf_config = HfOlmo2Config(**{key: value for key, value in config.items() if key not in ("dtype", "device")})
+    hf_config._attn_implementation = "eager"
+    reference = HfOlmo2ForCausalLM(hf_config).to(device="cuda:0", dtype=torch.float16).eval()
+    with torch.no_grad():
+        for name, parameter in reference.named_parameters():
+            if "norm.weight" in name:
+                parameter.copy_(torch.linspace(0.7, 1.3, parameter.numel(), device=parameter.device))
+    model = Olmo2ForCausalLM(config).eval()
+    model.load_weights([_StateDict(dict(reference.state_dict()))], 0, 1)
+    return model, reference
+
+
+def _assert_cached_logits(actual: torch.Tensor, reference: HfOlmo2ForCausalLM, histories: list[list[int]]) -> None:
+    with torch.inference_mode():
+        for index, history in enumerate(histories):
+            tokens = torch.tensor([history], device=actual.device)
+            expected = reference(
+                tokens,
+                attention_mask=torch.ones_like(tokens),
+                position_ids=torch.arange(len(history), device=actual.device)[None],
+                use_cache=False,
+            ).logits[:, -1]
+            # FP16 keeps rounding noise small while exercising the real paged
+            # backend. Full-checkpoint BF16 accuracy is checked separately.
+            torch.testing.assert_close(actual[index : index + 1], expected, rtol=0.02, atol=0.02)
+            error = (actual[index : index + 1].float() - expected.float()).square().mean().sqrt()
+            assert error <= 0.02 * expected.float().square().mean().sqrt()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="paged OLMo2 validation requires a CUDA GPU")
+@pytest.mark.parametrize("length", [127, 128, 129])
+def test_cuda_paged_cache_matches_full_history_across_block_boundary(length: int) -> None:
+    pytest.importorskip("flashinfer")
+    model, reference = _cached_cuda_models()
+    runner = _PagedModelRunner(model)
+    history = [(i * 7 + 3) % model.cfg.vocab_size for i in range(length + 3)]
+    pages = [[7, 2]]
+    initial = 60
+    runner.run([history[:initial]], [0], pages)
+    actual = runner.run([history[initial:length]], [initial], pages, chunked=True)
+    _assert_cached_logits(actual, reference, [history[:length]])
+    for step in range(1, 4):
+        actual = runner.run([[history[length + step - 1]]], [length + step - 1], pages)
+        _assert_cached_logits(actual, reference, [history[: length + step]])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="batched OLMo2 validation requires a CUDA GPU")
+def test_cuda_mixed_lengths_keep_request_cache_pages_isolated() -> None:
+    pytest.importorskip("flashinfer")
+    model, reference = _cached_cuda_models()
+    runner = _PagedModelRunner(model)
+    lengths = [3, 127, 129]
+    histories = [
+        [(i * 7 + request * 11) % model.cfg.vocab_size for i in range(n + 3)] for request, n in enumerate(lengths)
+    ]
+    pages = [[7], [4, 1], [6, 2]]
+    actual = runner.run([history[:n] for history, n in zip(histories, lengths)], [0, 0, 0], pages)
+    _assert_cached_logits(actual, reference, [history[:n] for history, n in zip(histories, lengths)])
+    for step in range(1, 4):
+        actual = runner.run(
+            [[history[n + step - 1]] for history, n in zip(histories, lengths)],
+            [n + step - 1 for n in lengths],
+            pages,
+        )
+        _assert_cached_logits(actual, reference, [history[: n + step] for history, n in zip(histories, lengths)])
 
 
 def test_registry_resolves_both_names_and_rejects_unverified_npu(monkeypatch: pytest.MonkeyPatch) -> None:
