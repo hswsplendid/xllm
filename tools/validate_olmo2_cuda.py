@@ -26,6 +26,7 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import Any
 
 import requests
 from tokenizers import Tokenizer
@@ -38,6 +39,20 @@ from scripts.logger import logger  # noqa: E402
 
 def _save(path: Path, data: object) -> None:
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n")
+
+
+def _validate_stream(result: dict[str, Any], events: list[dict[str, Any]], *, include_usage: bool) -> None:
+    # Matching text alone can hide an early EOF or an in-band server error.
+    for event in events:
+        line = event["line"]
+        if line.startswith("data: ") and line != "data: [DONE]" and "error" in json.loads(line[6:]):
+            raise ValueError("stream returned a server error")
+    if not events or events[-1]["line"] != "data: [DONE]":
+        raise ValueError("stream ended without [DONE]")
+    if result["finish_reason"] is None:
+        raise ValueError("stream ended without a finish reason")
+    if include_usage and result["usage"] is None:
+        raise ValueError("stream ended without the requested usage")
 
 
 def main() -> None:
@@ -90,7 +105,6 @@ def main() -> None:
         OMP_NUM_THREADS="2",
         MKL_NUM_THREADS="2",
         MAX_JOBS="4",
-        FLASHINFER_CUDA_ARCH_LIST="8.9",
     )
     env = os.environ.copy()
     env.update(overrides)
@@ -101,6 +115,8 @@ def main() -> None:
             env_overrides=overrides,
             binary_sha256=hashlib.sha256(binary.read_bytes()).hexdigest(),
             build=args.build_label,
+            # Leave architecture detection to FlashInfer unless the caller set it.
+            flashinfer_cuda_arch_list=env.get("FLASHINFER_CUDA_ARCH_LIST"),
         ),
     )
     tokenizer = AutoTokenizer.from_pretrained(model, local_files_only=True)
@@ -146,6 +162,10 @@ def main() -> None:
             )
             _save(out / f"{name}.json", record)
             assert response.status_code in expected, (name, record)
+            if payload and payload.get("stream") and response.status_code == 200:
+                _validate_stream(
+                    result, events, include_usage=bool(payload.get("stream_options", {}).get("include_usage"))
+                )
             return record
 
     def _base(prompt: object, n: int = 12) -> dict:
@@ -229,6 +249,10 @@ def main() -> None:
                 "chat-stream", {**chat, "stream": True, "stream_options": {"include_usage": True}}, True
             )["result"]
             assert result["choices"][0]["message"]["content"] == sresult["text"]
+            assert sresult["finish_reason"] == result["choices"][0]["finish_reason"] == "length"
+            for field in ("prompt_tokens", "completion_tokens", "total_tokens"):
+                assert sresult["usage"][field] == result["usage"][field]
+            assert sresult["usage"]["completion_tokens"] == 12
             rendered = tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
             # The official serialized tokenizer is also used by the C++ server.
             # Transformers 5's GPT2 reconstruction changes newline pretokenization.

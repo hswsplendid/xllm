@@ -12,6 +12,7 @@ FlashInfer paged attention, FP16, eager execution and TP=1/2. It depends on
 the OLMo2 C++ configuration loader (Z25, PR #2518). It is not a completed
 platform support announcement. NPU, quantization, graph execution and
 DP/CP/PP greater than one have not been accepted for this model.
+This contribution targets NVIDIA CUDA. Ascend adaptation is a separate task.
 
 The checkpoint has 16 layers, hidden size 2048, 16 MHA heads of size 128,
 intermediate size 8192, vocabulary size 100352 and a 4096-token context.
@@ -83,6 +84,14 @@ TP topology and FP16 dtype, template token count, stream equivalence,
 EOS/ignore_eos, explicit stop tokens/strings, length, invalid inputs and
 mixed-length concurrent isolation. These are service checks; they do not
 replace numerical comparison of logits.
+Every stream must report a finish reason and end with `[DONE]`; requested
+usage must also be present. Truncated chat streams and in-band errors fail
+acceptance even when all expected text has already arrived.
+
+The tool preserves `FLASHINFER_CUDA_ARCH_LIST` when set by the caller;
+otherwise FlashInfer detects the GPU architecture. It does not force the
+RTX 4090's architecture on other NVIDIA devices. The effective override is
+recorded in `launch.json`; validation on other GPU models is still required.
 
 For this server's allocator/FFI environment, the successful runs additionally
 set `LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libtcmalloc.so.4` and placed the
@@ -92,7 +101,7 @@ matching Python TVM-FFI `lib` directory first in `LD_LIBRARY_PATH`.
 
 ```bash
 python -m pytest tests/python/test_olmo2.py tests/python/test_registry.py \
-  tests/python/test_flashinfer_attention.py -q
+  tests/python/test_flashinfer_attention.py tests/python/test_validate_olmo2_cuda.py -q
 
 python tools/validate_olmo2_cuda.py \
   --model "$OLMO2_FP16" --binary "$XLLM_BINARY" \
