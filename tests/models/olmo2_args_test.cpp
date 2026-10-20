@@ -298,6 +298,38 @@ TEST_F(Olmo2ArgsTest, LoadsUnscaledRopeParameters) {
   EXPECT_FLOAT_EQ(args.rope_theta(), 750000.0f);
 }
 
+TEST_F(Olmo2ArgsTest, LoadsLegacyDefaultRopeParameters) {
+  config_["rope_parameters"] = {{"type", "default"}, {"rope_theta", 750000}};
+  ModelArgs args;
+  ASSERT_TRUE(load(&args));
+  EXPECT_FLOAT_EQ(args.rope_theta(), 750000.0f);
+}
+
+TEST_F(Olmo2ArgsTest, RejectsLegacyScaledRopeParameters) {
+  // LongRoPE can omit factor and derive scaling from the original context.
+  // Checking only factor would silently accept the legacy type alias.
+  config_["rope_parameters"] = {{"type", "longrope"},
+                                {"rope_theta", 500000},
+                                {"short_factor", std::vector<double>(64, 1.0)},
+                                {"long_factor", std::vector<double>(64, 2.0)},
+                                {"original_max_position_embeddings", 2048}};
+  ModelArgs args;
+  args.model_type("unchanged");
+  EXPECT_FALSE(load(&args));
+  EXPECT_EQ(args.model_type(), "unchanged");
+}
+
+TEST_F(Olmo2ArgsTest, CanonicalRopeTypeOverridesLegacyAlias) {
+  config_["rope_parameters"] = {
+      {"type", "longrope"}, {"rope_type", "default"}, {"rope_theta", 750000}};
+  ModelArgs args;
+  ASSERT_TRUE(load(&args));
+  EXPECT_FLOAT_EQ(args.rope_theta(), 750000.0f);
+  config_["rope_parameters"]["type"] = "default";
+  config_["rope_parameters"]["rope_type"] = "longrope";
+  EXPECT_FALSE(load(&args));
+}
+
 TEST_F(Olmo2ArgsTest, LoadsMultipleEosTokens) {
   config_["eos_token_id"] = {100257, 100278};
   ModelArgs args;
