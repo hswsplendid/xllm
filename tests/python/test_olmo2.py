@@ -114,6 +114,31 @@ def test_default_rope_parameters_preserve_theta() -> None:
     assert cfg.rope_theta == 123456.0
 
 
+def test_legacy_default_rope_parameters_preserve_theta() -> None:
+    cfg = Olmo2Config.from_dict(_config(rope_parameters={"type": "default", "rope_theta": 123456.0}))
+    assert cfg.rope_theta == 123456.0
+
+
+def test_legacy_longrope_parameters_are_rejected() -> None:
+    parameters = {
+        "type": "longrope",
+        "rope_theta": 10000.0,
+        "short_factor": [1.0, 1.0],
+        "long_factor": [2.0, 2.0],
+        "original_max_position_embeddings": 16,
+    }
+    with pytest.raises(ValueError, match="unscaled RoPE"):
+        Olmo2Config.from_dict(_config(rope_parameters=parameters))
+
+
+def test_canonical_rope_type_overrides_legacy_alias() -> None:
+    parameters = {"type": "longrope", "rope_type": "default", "rope_theta": 123456.0}
+    assert Olmo2Config.from_dict(_config(rope_parameters=parameters)).rope_theta == 123456.0
+    parameters.update(type="default", rope_type="longrope")
+    with pytest.raises(ValueError, match="unscaled RoPE"):
+        Olmo2Config.from_dict(_config(rope_parameters=parameters))
+
+
 def test_native_backend_discovery_for_formal_entrypoint() -> None:
     assert xllm_export.get_model_backend("olmo2") == "llm"
     fixture = Path(__file__).parents[1] / "models/fixtures/olmo2"
