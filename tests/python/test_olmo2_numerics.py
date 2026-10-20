@@ -29,6 +29,9 @@ from transformers import Olmo2ForCausalLM as HfModel
 
 from tools import validate_olmo2_numerics as validation
 from xllm.python.models.olmo2 import Olmo2ForCausalLM
+from xllm.python.platform import current_platform
+
+pytestmark = pytest.mark.skipif(not current_platform.is_cuda(), reason="OLMo2 numerical validation targets CUDA")
 
 _LIMITS = {"rmse": 0.01, "max_abs": 0.02, "nrmse_cap": 0.02, "cosine_floor": 0.999}
 
