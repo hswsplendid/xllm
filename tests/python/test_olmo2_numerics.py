@@ -71,6 +71,46 @@ def test_frozen_protocol_includes_boundaries_chunking_and_full_budget_sets() -> 
     assert max(case["length"] + case["decode"] for case in cases) == 4096
     assert any(case.get("initial", case["length"]) < case["length"] for case in cases)
     assert fixture["input_ids"] == validation._sequence(fixture, 25)
+    assert validation._required_cache_blocks(fixture) == 64
+
+
+def test_cache_capacity_accounts_for_disjoint_reference_and_mixed_requests() -> None:
+    fixture = {
+        "input_ids": [1],
+        "cases": [{"name": name, "length": 128, "decode": 1} for name in ("a", "b", "c")],
+        "batches": [["a", "b", "c"]],
+    }
+    assert validation._required_cache_blocks(fixture) == 6
+    fixture["batches"] = []
+    assert validation._required_cache_blocks(fixture) == 4
+
+
+def test_cache_capacity_rejects_truncated_matrix_before_checkpoint_load(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("WORLD_SIZE", "1")
+    monkeypatch.setenv("LOCAL_RANK", "0")
+    monkeypatch.setenv("RANK", "0")
+    monkeypatch.setattr(
+        validation.sys,
+        "argv",
+        [
+            "validator",
+            "validate",
+            "--model",
+            str(tmp_path),
+            "--reference",
+            str(tmp_path),
+            "--output",
+            str(tmp_path / "output"),
+            "--cache-blocks",
+            "63",
+        ],
+    )
+    with pytest.raises(SystemExit) as error:
+        validation.main()
+    assert error.value.code == 2
+    assert not (tmp_path / "output").exists()
 
 
 def test_missing_reference_node_and_nonfinite_reference_are_rejected(tmp_path: Path) -> None:

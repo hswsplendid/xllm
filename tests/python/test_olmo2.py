@@ -33,7 +33,14 @@ from xllm.python import distributed, registry
 from xllm.python.attention.backend import AttentionBackend, AttentionMetadata, LayerCache
 from xllm.python.layers.attention import Attention
 from xllm.python.model_executor.forward_context import ForwardContext, forward_context
-from xllm.python.models.olmo2 import Olmo2Attention, Olmo2Config, Olmo2ForCausalLM, Olmo2RMSNorm
+from xllm.python.models.olmo2 import (
+    Olmo2Attention,
+    Olmo2Config,
+    Olmo2ForCausalLM,
+    Olmo2RMSNorm,
+    _Olmo2ColumnParallelLinear,
+    _Olmo2RowParallelLinear,
+)
 from xllm.python.platform import current_platform
 
 pytestmark = pytest.mark.skipif(not current_platform.is_cuda(), reason="OLMo2 currently supports the CUDA runtime only")
@@ -344,6 +351,62 @@ def test_small_post_norm_updates_survive_repeated_residual_additions(dtype: torc
     torch.testing.assert_close(hidden.float(), torch.full_like(hidden.float(), 1.008), rtol=0, atol=2e-5)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="BF16 projection test requires CUDA")
+@pytest.mark.parametrize("row_parallel", [False, True])
+def test_bf16_projection_preserves_small_residual_input(row_parallel: bool) -> None:
+    layer_type = _Olmo2RowParallelLinear if row_parallel else _Olmo2ColumnParallelLinear
+    layer = layer_type(2, 1, 1, dtype=torch.bfloat16, device="cuda:0")
+    with torch.no_grad():
+        layer.weight.copy_(torch.tensor([[1.0, -1.0]], device="cuda:0"))
+    value = torch.tensor([[1.001, 1.0], [1.0, 1.002]], device="cuda:0")
+    with torch.inference_mode():
+        actual = layer(value)
+        expected = value @ layer.weight.float().t()
+        rounded = torch.nn.functional.linear(value.bfloat16(), layer.weight).float()
+    assert actual.dtype == torch.float32 and layer.weight.dtype == torch.bfloat16
+    torch.testing.assert_close(actual, expected, rtol=0, atol=2e-6)
+    assert torch.count_nonzero(rounded) == 0
+    assert torch.count_nonzero(actual) == 2
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="BF16 projection test requires CUDA")
+def test_bf16_row_projection_reduces_fp32_before_replicated_bias(monkeypatch: pytest.MonkeyPatch) -> None:
+    layer = _Olmo2RowParallelLinear(2, 1, 2, bias=True, dtype=torch.bfloat16, device="cuda:0")
+    with torch.no_grad():
+        layer.weight.copy_(torch.tensor([[1.0, -1.0]], device="cuda:0"))
+        layer.bias.fill_(0.25)
+    layer.weight.data = layer.weight.data.t().contiguous()
+    layer._weight_is_transposed = True
+    calls: list[torch.Tensor] = []
+
+    def _sum(value: torch.Tensor) -> None:
+        calls.append(value.clone())
+        value.add_(0.002)
+
+    monkeypatch.setattr(distributed, "tp_all_reduce", _sum)
+    with torch.inference_mode():
+        actual = layer(torch.tensor([[1.001, 1.0]], device="cuda:0"))
+    assert len(calls) == 1 and calls[0].dtype == torch.float32
+    torch.testing.assert_close(calls[0], torch.full_like(calls[0], 0.001), rtol=0, atol=2e-6)
+    torch.testing.assert_close(actual, torch.full_like(actual, 0.253), rtol=0, atol=2e-6)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="BF16 projection test requires CUDA")
+def test_bf16_lm_head_gathers_fp32_vocabulary_shards(monkeypatch: pytest.MonkeyPatch) -> None:
+    layer = _Olmo2ColumnParallelLinear(2, 1, 2, gather_output=True, dtype=torch.bfloat16, device="cuda:0")
+    with torch.no_grad():
+        layer.weight.copy_(torch.tensor([[1.0, -1.0]], device="cuda:0"))
+
+    def _gather(value: torch.Tensor, dim: int, world_size: int) -> torch.Tensor:
+        assert value.dtype == torch.float32 and dim == -1 and world_size == 2
+        return torch.cat((value, -value), dim=-1)
+
+    monkeypatch.setattr(distributed, "tp_all_gather", _gather)
+    with torch.inference_mode():
+        actual = layer(torch.tensor([[1.001, 1.0]], device="cuda:0"))
+    torch.testing.assert_close(actual, torch.tensor([[0.001, -0.001]], device="cuda:0"), rtol=0, atol=2e-6)
+
+
 class _PagedModelRunner:
     """Drive the production FlashInfer backend with disjoint request pages."""
 
@@ -361,6 +424,7 @@ class _PagedModelRunner:
             0,
             model.device,
             model.dtype,
+            use_tensor_core_decode=attention.use_tensor_core_decode,
         )
         shape = (8, self.block_size, attention.num_kv_heads, attention.head_dim)
         self.caches = [
@@ -413,7 +477,7 @@ class _PagedModelRunner:
             return self.model.compute_logits(self.model.model(tokens, position_ids), selected)
 
 
-def _cached_cuda_models() -> tuple[Olmo2ForCausalLM, HfOlmo2ForCausalLM]:
+def _cached_cuda_models(dtype: torch.dtype) -> tuple[Olmo2ForCausalLM, HfOlmo2ForCausalLM]:
     torch.manual_seed(20261020)
     config = _config(
         hidden_size=256,
@@ -422,12 +486,12 @@ def _cached_cuda_models() -> tuple[Olmo2ForCausalLM, HfOlmo2ForCausalLM]:
         head_dim=128,
         intermediate_size=512,
         max_position_embeddings=256,
-        dtype="float16",
+        dtype=dtype,
         device="cuda:0",
     )
     hf_config = HfOlmo2Config(**{key: value for key, value in config.items() if key not in ("dtype", "device")})
     hf_config._attn_implementation = "eager"
-    reference = HfOlmo2ForCausalLM(hf_config).to(device="cuda:0", dtype=torch.float16).eval()
+    reference = HfOlmo2ForCausalLM(hf_config).to(device="cuda:0", dtype=dtype).eval()
     with torch.no_grad():
         for name, parameter in reference.named_parameters():
             if "norm.weight" in name:
@@ -437,7 +501,12 @@ def _cached_cuda_models() -> tuple[Olmo2ForCausalLM, HfOlmo2ForCausalLM]:
     return model, reference
 
 
-def _assert_cached_logits(actual: torch.Tensor, reference: HfOlmo2ForCausalLM, histories: list[list[int]]) -> None:
+def _assert_cached_logits(
+    actual: torch.Tensor,
+    reference: HfOlmo2ForCausalLM,
+    histories: list[list[int]],
+    full_runner: _PagedModelRunner,
+) -> None:
     with torch.inference_mode():
         for index, history in enumerate(histories):
             tokens = torch.tensor([history], device=actual.device)
@@ -447,49 +516,66 @@ def _assert_cached_logits(actual: torch.Tensor, reference: HfOlmo2ForCausalLM, h
                 position_ids=torch.arange(len(history), device=actual.device)[None],
                 use_cache=False,
             ).logits[:, -1]
-            # FP16 keeps rounding noise small while exercising the real paged
-            # backend. Full-checkpoint BF16 accuracy is checked separately.
-            torch.testing.assert_close(actual[index : index + 1], expected, rtol=0.02, atol=0.02)
-            error = (actual[index : index + 1].float() - expected.float()).square().mean().sqrt()
-            assert error <= 0.02 * expected.float().square().mean().sqrt()
+            # Both compute dtypes exercise the real backend; use a common
+            # comparison dtype because BF16 projections return FP32 logits.
+            torch.testing.assert_close(actual[index : index + 1].float(), expected.float(), rtol=0.02, atol=0.02)
+            if reference.dtype == torch.float16:
+                # Retain the established FP16-vs-HF numerical requirement.
+                error = (actual[index : index + 1].float() - expected.float()).square().mean().sqrt()
+                assert error <= 0.02 * expected.float().square().mean().sqrt()
+            # Cache invariance must compare the same model/precision policy.
+            # Use separate cache storage so full prefill cannot repair a bad
+            # incremental cache. Full-checkpoint BF16/HF budgets live in the
+            # independent frozen numerical validation fixture.
+            full = full_runner.run([history], [0], [[7, 2]])
+            observed = actual[index : index + 1].float()
+            torch.testing.assert_close(observed, full.float(), rtol=0.02, atol=0.02)
+            error = (observed - full.float()).square().mean().sqrt()
+            assert error <= 0.02 * full.float().square().mean().sqrt()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="paged OLMo2 validation requires a CUDA GPU")
 @pytest.mark.parametrize("length", [127, 128, 129])
-def test_cuda_paged_cache_matches_full_history_across_block_boundary(length: int) -> None:
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_cuda_paged_cache_matches_full_history_across_block_boundary(length: int, dtype: torch.dtype) -> None:
     pytest.importorskip("flashinfer")
-    model, reference = _cached_cuda_models()
+    model, reference = _cached_cuda_models(dtype)
     runner = _PagedModelRunner(model)
+    full_runner = _PagedModelRunner(model)
     history = [(i * 7 + 3) % model.cfg.vocab_size for i in range(length + 3)]
     pages = [[7, 2]]
     initial = 60
     runner.run([history[:initial]], [0], pages)
     actual = runner.run([history[initial:length]], [initial], pages, chunked=True)
-    _assert_cached_logits(actual, reference, [history[:length]])
+    _assert_cached_logits(actual, reference, [history[:length]], full_runner)
     for step in range(1, 4):
         actual = runner.run([[history[length + step - 1]]], [length + step - 1], pages)
-        _assert_cached_logits(actual, reference, [history[: length + step]])
+        _assert_cached_logits(actual, reference, [history[: length + step]], full_runner)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="batched OLMo2 validation requires a CUDA GPU")
-def test_cuda_mixed_lengths_keep_request_cache_pages_isolated() -> None:
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_cuda_mixed_lengths_keep_request_cache_pages_isolated(dtype: torch.dtype) -> None:
     pytest.importorskip("flashinfer")
-    model, reference = _cached_cuda_models()
+    model, reference = _cached_cuda_models(dtype)
     runner = _PagedModelRunner(model)
+    full_runner = _PagedModelRunner(model)
     lengths = [3, 127, 129]
     histories = [
         [(i * 7 + request * 11) % model.cfg.vocab_size for i in range(n + 3)] for request, n in enumerate(lengths)
     ]
     pages = [[7], [4, 1], [6, 2]]
     actual = runner.run([history[:n] for history, n in zip(histories, lengths)], [0, 0, 0], pages)
-    _assert_cached_logits(actual, reference, [history[:n] for history, n in zip(histories, lengths)])
+    _assert_cached_logits(actual, reference, [history[:n] for history, n in zip(histories, lengths)], full_runner)
     for step in range(1, 4):
         actual = runner.run(
             [[history[n + step - 1]] for history, n in zip(histories, lengths)],
             [n + step - 1 for n in lengths],
             pages,
         )
-        _assert_cached_logits(actual, reference, [history[: n + step] for history, n in zip(histories, lengths)])
+        _assert_cached_logits(
+            actual, reference, [history[: n + step] for history, n in zip(histories, lengths)], full_runner
+        )
 
 
 def test_registry_resolves_both_names_and_rejects_unverified_npu(monkeypatch: pytest.MonkeyPatch) -> None:

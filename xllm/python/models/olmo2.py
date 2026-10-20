@@ -139,6 +139,60 @@ class Olmo2Config:
         return cfg
 
 
+def _bf16_linear_fp32(value: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """Preserve FP32 activations using two BF16 products with FP32 outputs.
+
+    Weights remain in the checkpoint dtype. Rounding an FP32 residual to one
+    BF16 input discards small updates; the second product recovers that input
+    rounding error before post-attention/post-FF normalization.
+    """
+    low = value.to(torch.bfloat16)
+    output = torch.mm(low, weight, out_dtype=torch.float32)
+    if value.dtype == torch.float32:
+        correction = (value - low.float()).to(torch.bfloat16)
+        # The first product owns its storage; avoid a third full-size FP32
+        # output allocation when adding the correction during long prefill.
+        output.add_(torch.mm(correction, weight, out_dtype=torch.float32))
+    return output
+
+
+class _Olmo2ColumnParallelLinear(ColumnParallelLinear):
+    def forward(self, value: torch.Tensor) -> torch.Tensor:
+        if self.weight.dtype != torch.bfloat16 or self.weight.device.type != "cuda":
+            return super().forward(value)
+        output = _bf16_linear_fp32(value, self.weight.t())
+        if self.bias is not None:
+            output = output + self.bias.float()
+        if self.gather_output and self.tp_size > 1:
+            output = distributed.tp_all_gather(output, dim=-1, world_size=self.tp_size)
+        return output
+
+
+class _Olmo2RowParallelLinear(RowParallelLinear):
+    def forward(self, value: torch.Tensor) -> torch.Tensor:
+        if self.weight.dtype != torch.bfloat16 or self.weight.device.type != "cuda":
+            return super().forward(value)
+        weight = self.weight if self._weight_is_transposed else self.weight.t()
+        output = _bf16_linear_fp32(value, weight)
+        if self.tp_size > 1 and self.reduce_results:
+            distributed.tp_all_reduce(output)
+        if self.bias is not None:
+            output = output + self.bias.float()
+        return output
+
+
+class _Olmo2MLP(GatedMLP):
+    def __init__(self, cfg: Olmo2Config, dtype: torch.dtype, device: torch.device) -> None:
+        nn.Module.__init__(self)
+        local_intermediate = cfg.intermediate_size // cfg.tp_size
+        self.gate_up_proj = _Olmo2ColumnParallelLinear(
+            cfg.hidden_size, 2 * local_intermediate, cfg.tp_size, dtype=dtype, device=device
+        )
+        self.down_proj = _Olmo2RowParallelLinear(
+            local_intermediate, cfg.hidden_size, cfg.tp_size, dtype=dtype, device=device
+        )
+
+
 class Olmo2RMSNorm(nn.Module):
     """Keep statistics and gamma multiplication in FP32 until the final cast."""
 
@@ -162,10 +216,10 @@ class Olmo2Attention(nn.Module):
         self.num_heads = cfg.n_heads // cfg.tp_size
         self.head_dim = cfg.head_dim
         self.local_size = self.num_heads * self.head_dim
-        self.qkv_proj = ColumnParallelLinear(
+        self.qkv_proj = _Olmo2ColumnParallelLinear(
             cfg.hidden_size, 3 * self.local_size, cfg.tp_size, dtype=dtype, device=device
         )
-        self.o_proj = RowParallelLinear(self.local_size, cfg.hidden_size, cfg.tp_size, dtype=dtype, device=device)
+        self.o_proj = _Olmo2RowParallelLinear(self.local_size, cfg.hidden_size, cfg.tp_size, dtype=dtype, device=device)
         self.q_norm = Olmo2RMSNorm(self.local_size, cfg.rms_norm_eps, dtype, device)
         self.k_norm = Olmo2RMSNorm(self.local_size, cfg.rms_norm_eps, dtype, device)
         self.attn = Attention(
@@ -175,6 +229,9 @@ class Olmo2Attention(nn.Module):
             scale=cfg.head_dim**-0.5,
             sliding_window=0,
             layer_id=layer_id,
+            # Match the prefill tensor-core accumulation path for BF16 decode;
+            # small rounding changes otherwise compound through post-norms.
+            use_tensor_core_decode=True if dtype == torch.bfloat16 else None,
         )
 
     def _normalize_qk(self, q: torch.Tensor, k: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -195,7 +252,10 @@ class Olmo2Attention(nn.Module):
         shape = (-1, self.num_heads, self.head_dim)
         q = apply_rotary_half(q.reshape(shape).float(), cos_half, sin_half).to(q.dtype).flatten(1)
         k = apply_rotary_half(k.reshape(shape).float(), cos_half, sin_half).to(k.dtype).flatten(1)
-        return self.o_proj(self.attn(q, k, v.contiguous()))
+        # Keep backend Q/K/V and paged caches in the checkpoint compute dtype;
+        # the higher-precision projections/norms do not change the cache format.
+        dtype = self.qkv_proj.weight.dtype
+        return self.o_proj(self.attn(q.to(dtype), k.to(dtype), v.to(dtype).contiguous()))
 
     def load_weights(self, weights: ScopedWeightLoader, context: ParallelLoadContext) -> None:
         load_gqa_fused_attention(self, weights, context, self.cfg.n_kv_heads, qk_norm=False)
@@ -211,16 +271,20 @@ class Olmo2DecoderLayer(nn.Module):
         self.self_attn = Olmo2Attention(cfg, layer_id, dtype, device)
         self.post_attention_layernorm = Olmo2RMSNorm(cfg.hidden_size, cfg.rms_norm_eps, dtype, device)
         self.post_feedforward_layernorm = Olmo2RMSNorm(cfg.hidden_size, cfg.rms_norm_eps, dtype, device)
-        self.mlp = GatedMLP(cfg.hidden_size, cfg.intermediate_size, cfg.tp_size, dtype, device)
+        self.mlp = _Olmo2MLP(cfg, dtype, device)
+        self._preserve_bf16_input = dtype == torch.bfloat16 and device.type == "cuda"
 
     def forward(self, hidden: torch.Tensor, cos_half: torch.Tensor, sin_half: torch.Tensor) -> torch.Tensor:
         # Row-parallel projections have already reduced their partial outputs.
         # Preserve small post-norm updates across layers in the FP32 residual
-        # stream; projections and attention retain the checkpoint compute dtype.
+        # stream. BF16 projections preserve this input via compensated products;
+        # FP16 retains the established projection path and attention dtype.
         dtype = self.self_attn.qkv_proj.weight.dtype
-        attention = self.self_attn(hidden.to(dtype), cos_half, sin_half)
+        attention_input = hidden if self._preserve_bf16_input else hidden.to(dtype)
+        attention = self.self_attn(attention_input, cos_half, sin_half)
         hidden = hidden.float() + self.post_attention_layernorm(attention)
-        return hidden + self.post_feedforward_layernorm(self.mlp(hidden.to(dtype)))
+        mlp_input = hidden if self._preserve_bf16_input else hidden.to(dtype)
+        return hidden + self.post_feedforward_layernorm(self.mlp(mlp_input))
 
     def load_weights(self, weights: ScopedWeightLoader, context: ParallelLoadContext) -> None:
         self.self_attn.load_weights(weights.with_prefix("self_attn."), context)
@@ -241,6 +305,7 @@ class Olmo2Model(nn.Module):
         )
         self.layers = nn.ModuleList(Olmo2DecoderLayer(cfg, i, dtype, device) for i in range(cfg.n_layers))
         self.norm = Olmo2RMSNorm(cfg.hidden_size, cfg.rms_norm_eps, dtype, device)
+        self._preserve_bf16_input = dtype == torch.bfloat16 and device.type == "cuda"
 
     def forward(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         if get_forward_context().cp_context is not None:
@@ -250,7 +315,8 @@ class Olmo2Model(nn.Module):
         for i, layer in enumerate(self.layers):
             hidden = layer(hidden, cos_half, sin_half)
             record_layer_event(i)
-        return self.norm(hidden).to(self.embed_tokens.weight.dtype)
+        normalized = self.norm(hidden)
+        return normalized if self._preserve_bf16_input else normalized.to(self.embed_tokens.weight.dtype)
 
 
 def _checkpoint_shapes(cfg: Olmo2Config) -> dict[str, tuple[int, ...]]:
@@ -330,7 +396,7 @@ class Olmo2ForCausalLM(PyModelBase):
             raise ValueError("OLMo2 requires float32, float16 or bfloat16")
         self.device = torch.device(config.get("device", "cuda"))
         self.model = Olmo2Model(self.cfg, self.dtype, self.device)
-        self.lm_head = ColumnParallelLinear(
+        self.lm_head = _Olmo2ColumnParallelLinear(
             self.cfg.hidden_size,
             self.cfg.vocab_size // self.cfg.tp_size,
             self.cfg.tp_size,

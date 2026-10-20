@@ -39,7 +39,7 @@ from safetensors import safe_open
 _ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_ROOT))
 from scripts.logger import logger  # noqa: E402
-from tools.olmo2_numerics import _Capture, _Runner  # noqa: E402
+from tools.olmo2_numerics import _BLOCK, _Capture, _Runner  # noqa: E402
 
 _FIXTURE = _ROOT / "tests/models/fixtures/olmo2/numerics.json"
 _LOCAL_NODES = frozenset(
@@ -455,6 +455,16 @@ def _check_output_keys(outputs: dict[str, dict[str, torch.Tensor]], fixture: dic
         raise ValueError("incomplete or unexpected output matrix")
 
 
+def _required_cache_blocks(fixture: dict[str, Any]) -> int:
+    # Cached and independently recomputed histories need disjoint pages.
+    pages = {case["name"]: math.ceil((case["length"] + case["decode"]) / _BLOCK) for case in fixture["cases"]}
+    return max(
+        math.ceil(len(fixture["input_ids"]) / _BLOCK),
+        2 * max(pages.values()),
+        max((sum(pages[name] for name in batch) for batch in fixture["batches"]), default=0),
+    )
+
+
 def _validate(args: argparse.Namespace, fixture: dict[str, Any], identity: dict[str, str], rank: int) -> bool:
     _reference_manifest(args.reference, identity)
     nodes = _load_tensors(args.reference / "nodes-bf16.pt", set(fixture["node_budgets"]))
@@ -497,7 +507,7 @@ def _validate(args: argparse.Namespace, fixture: dict[str, Any], identity: dict[
 
         distributed.init_tp_group(args.tp_host, args.tp_port, rank, args.tp, f"cuda:{rank}", rank, args.tp, 0)
     _save(args.output / f"weights-rank{rank}.json", _audit_weights(model, args.model, rank, args.tp))
-    runner = _Runner(model, blocks=80)
+    runner = _Runner(model, blocks=args.cache_blocks)
     for cache in runner.caches:
         cache.key.fill_(float("nan"))
         cache.value.fill_(float("nan"))
@@ -543,6 +553,7 @@ def _validate(args: argparse.Namespace, fixture: dict[str, Any], identity: dict[
         "rank": rank,
         "dtype": args.dtype,
         "checkpoint_keys": len(model.loaded_checkpoint_keys),
+        "cache_blocks": args.cache_blocks,
         "status": "PASS" if passed else "FAIL",
         "rank_logits_equal": rank_equal,
         "reference_manifest_sha256": _sha(args.reference / "manifest.json"),
@@ -579,6 +590,7 @@ def main() -> int:
     )
     parser.add_argument("--tp-host", default="127.0.0.1", help="single-node xLLM rendezvous address")
     parser.add_argument("--dtype", choices=("float16", "bfloat16"), default="float16")
+    parser.add_argument("--cache-blocks", type=int, default=80, help="Physical KV pages; must cover the full matrix.")
     args = parser.parse_args()
     world, rank = int(os.environ.get("WORLD_SIZE", "1")), int(os.environ.get("LOCAL_RANK", "0"))
     if world != args.tp or (args.mode != "validate" and world != 1):
@@ -590,6 +602,8 @@ def main() -> int:
     if not __debug__:
         parser.error("validation requires assertions enabled; do not use python -O")
     fixture = json.loads(_FIXTURE.read_text())
+    if args.mode == "validate" and args.cache_blocks < _required_cache_blocks(fixture):
+        parser.error(f"the complete frozen matrix requires at least {_required_cache_blocks(fixture)} cache blocks")
     identity = _checkpoint(args.model, fixture)
     if rank == 0:
         args.output.mkdir(parents=True, exist_ok=False)

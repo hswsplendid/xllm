@@ -55,8 +55,9 @@ def test_loaded_configuration_rejects_incorrect_dtype_or_topology(fault: str) ->
 
 
 @pytest.mark.parametrize("architecture", [None, "8.0"])
+@pytest.mark.parametrize("memory,cache", [(0.4, 1073741824), (0.99, 536870912)])
 def test_launch_preserves_architecture_selection(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, architecture: str | None
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, architecture: str | None, memory: float, cache: int
 ) -> None:
     if architecture is None:
         monkeypatch.delenv("FLASHINFER_CUDA_ARCH_LIST", raising=False)
@@ -86,11 +87,55 @@ def test_launch_preserves_architecture_selection(
             str(tmp_path / "output"),
             "--tp",
             "1",
+            "--max-memory-utilization",
+            str(memory),
+            "--max-cache-size",
+            str(cache),
         ],
     )
     with pytest.raises(RuntimeError, match="stop before launching"):
         validation.main()
     assert captured.get("FLASHINFER_CUDA_ARCH_LIST") == architecture
+    command = json.loads((tmp_path / "output" / "launch.json").read_text())["command"]
+    assert f"--max_memory_utilization={memory}" in command
+    assert f"--max_cache_size={cache}" in command
+
+
+@pytest.mark.parametrize(
+    "option,value",
+    [
+        ("--max-memory-utilization", "0"),
+        ("--max-memory-utilization", "1.1"),
+        ("--max-memory-utilization", "nan"),
+        ("--max-cache-size", "0"),
+        ("--max-cache-size", "-1"),
+    ],
+)
+def test_invalid_memory_budget_is_rejected_before_launch(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, option: str, value: str
+) -> None:
+    output = tmp_path / "output"
+    monkeypatch.setattr(
+        validation.sys,
+        "argv",
+        [
+            "validate_olmo2_cuda.py",
+            "--model",
+            str(tmp_path),
+            "--binary",
+            str(tmp_path / "xllm"),
+            "--output",
+            str(output),
+            "--tp",
+            "1",
+            option,
+            value,
+        ],
+    )
+    with pytest.raises(SystemExit) as error:
+        validation.main()
+    assert error.value.code == 2
+    assert not output.exists()
 
 
 @pytest.mark.parametrize("fault", ["missing_done", "missing_finish", "missing_usage", "stream_error"])

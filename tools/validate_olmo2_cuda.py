@@ -87,9 +87,13 @@ def main() -> None:
     )
     parser.add_argument("--devices", help="Comma-separated physical GPU IDs, one per rank.")
     parser.add_argument("--port", type=int, default=18000)
+    parser.add_argument("--max-memory-utilization", type=float, default=0.4)
+    parser.add_argument("--max-cache-size", type=int, default=1073741824, help="Per-rank KV cache cap in bytes.")
     parser.add_argument("--benchmark", action="store_true")
     parser.add_argument("--build-label", default="unspecified; record compiler flags separately")
     args = parser.parse_args()
+    if not 0 < args.max_memory_utilization <= 1 or args.max_cache_size <= 0:
+        parser.error("memory utilization must be in (0, 1] and cache size must be positive")
     model = str(args.model.resolve())
     devices = args.devices.split(",") if args.devices else [str(i) for i in range(args.tp)]
     if len(devices) != args.tp or len(set(devices)) != args.tp:
@@ -107,8 +111,8 @@ def main() -> None:
         "--host=127.0.0.1",
         f"--port={port}",
         f"--master_node_addr=127.0.0.1:{port + 1000}",
-        "--max_memory_utilization=0.4",
-        "--max_cache_size=1073741824",
+        f"--max_memory_utilization={args.max_memory_utilization}",
+        f"--max_cache_size={args.max_cache_size}",
         "--max_tokens_per_batch=256",
         "--max_seqs_per_batch=4",
         "--enable_graph=false",
@@ -396,6 +400,8 @@ def main() -> None:
                     profiling=False,
                     build=args.build_label,
                     prefix_cache=False,
+                    max_memory_utilization=args.max_memory_utilization,
+                    max_cache_size_bytes=args.max_cache_size,
                     tpot_definition="(request_end - first_nonempty_text) / (completion_tokens - 1)",
                     limitations=[
                         "client-observed effective TPOT, including invisible tokens and transport",

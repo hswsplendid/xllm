@@ -8,7 +8,8 @@ sidebar:
 
 本预览针对 `allenai/OLMo-2-0425-1B-Instruct`，固定 revision
 `48d788eca847d4d7548f375ad03d3c9312f6139e`，使用 Python executor、
-FlashInfer 分页 attention、FP16、eager、TP=1/2。依赖 OLMo2 C++ 配置
+FlashInfer 分页 attention、FP16/BF16、eager、TP=1/2。两种计算精度均已在
+本机 CUDA 环境通过冻结数值矩阵和真实 HTTP 验收。依赖 OLMo2 C++ 配置
 加载前置 Z25（PR #2518）。当前不是完整平台支持声明；NPU、量化、图执行
 以及大于1的 DP/CP/PP 尚未完成本模型验收。
 本次贡献目标为 NVIDIA CUDA；Ascend 适配是后续独立任务。
@@ -17,7 +18,13 @@ FlashInfer 分页 attention、FP16、eager、TP=1/2。依赖 OLMo2 C++ 配置
 context4096。Q/K RMSNorm 在 reshape head 和 RoPE 前覆盖完整投影维度；
 TP=2 跨 rank 分别归约 FP32 Q/K 平方和，再应用分片 norm 权重。
 attention/MLP 的 post-norm 输出加入 FP32 残差流，投影权重和 KV cache
-保持 FP16；embedding 与 LM head 使用独立权重。
+保持所选 FP16/BF16 计算 dtype；embedding 与 LM head 使用独立权重。
+
+CUDA BF16 将 FP32 投影输入拆成 BF16 舍入值与 BF16 残差补偿，两次 GEMM
+输出 FP32 后相加，再做归一化；行并行归约和 LM head logits 也保留 FP32。
+BF16 decode 显式选择 FlashInfer tensor cores。权重和 KV cache 仍为 BF16。
+此混合精度策略增加 GEMM 计算以及 FP32 激活/通信内存，并非纯 BF16 运算，
+也没有据此声明提速。FP16 保留原有投影及 decode 策略。
 
 ## 创建独立 FP16 配置
 
@@ -61,13 +68,16 @@ Transformers5.12.1、FlashInfer0.6.14、TVM-FFI0.1.13。
 ```bash
 export XLLM_BINARY=/path/to/built/xllm
 python tools/validate_olmo2_cuda.py \
-  --model "$OLMO2_FP16" --binary "$XLLM_BINARY" \
+  --model "$OLMO2_FP16" --binary "$XLLM_BINARY" --dtype float16 \
   --tp 1 --devices 0 --port 18000 --output /tmp/olmo2-tp1
 
 python tools/validate_olmo2_cuda.py \
-  --model "$OLMO2_FP16" --binary "$XLLM_BINARY" \
+  --model "$OLMO2_FP16" --binary "$XLLM_BINARY" --dtype float16 \
   --tp 2 --devices 0,1 --port 18000 --output /tmp/olmo2-tp2
 ```
+
+BF16 使用原始目录 `--model "$OLMO2_SOURCE" --dtype bfloat16`。
+`--dtype` 仅核对实际加载配置，不转换 checkpoint，也不覆盖服务端计算配置。
 
 每次使用新的输出目录。工具只启动和停止自己的服务，保存命令、请求与 SSE，
 遇到不一致即失败。TP=2 使用两个本机进程，分别设置
@@ -75,6 +85,10 @@ python tools/validate_olmo2_cuda.py \
 可见两卡不会自动形成 TP=2。工具核对实际加载的 TP/dtype、模板 token 数、
 流式一致性、EOS/ignore_eos、stop token/string、长度、错误输入及混合并发隔离。
 这些属于服务验收，不能代替 logits 数值对照。
+共享 GPU 可通过 `--max-memory-utilization` 和 `--max-cache-size` 显式设置
+引擎已有内存参数，默认仍为0.4及每rank 1073741824字节。设置前须检查实际
+空闲显存；启动记录和性能文件保存有效值。小cache可能增加抢占/重算，
+不同容量的吞吐不能作受控性能对比。这些参数不改变请求或验收断言。
 所有流式响应必须带有结束原因并以 `[DONE]` 结束，请求了 usage 时还必须返回
 usage。即使完整文本已到达，截断的 chat 流或流内错误也不能通过验收。
 
@@ -93,7 +107,7 @@ python -m pytest tests/python/test_olmo2.py tests/python/test_registry.py \
   tests/python/test_flashinfer_attention.py tests/python/test_validate_olmo2_cuda.py -q
 
 python tools/validate_olmo2_cuda.py \
-  --model "$OLMO2_FP16" --binary "$XLLM_BINARY" \
+  --model "$OLMO2_FP16" --binary "$XLLM_BINARY" --dtype float16 \
   --tp 1 --devices 0 --port 18000 --output /tmp/olmo2-benchmark \
   --benchmark --build-label "填写实际编译选项"
 ```
@@ -109,7 +123,7 @@ tokens。这是客户端指标，不是逐token到达间隔或kernel时间。分
 不代表发布性能，也没有据此声明加速。
 
 
-本机开发基线使用两张各报告48537MiB的RTX4090。下表为三次重复的总输出吞吐
+本机开发基线使用两张各报告48537MiB的RTX4090。下表为历史 FP16 三次重复的总输出吞吐
 中位数及范围，原始请求保留在贡献证据中。两种TP配置分别记录，不视为优化对照。
 
 | TP | Prompt tokens | 并发 | 输出tokens/s，中位数（范围） |
@@ -133,13 +147,16 @@ TP2分片后的cache容量也不同。不能据此声明发布加速或量化col
 独立Q/K求和。多个小Torch算子及转换提示后续可调查CPU发射开销；本轮未新增
 kernel优化，也没有声明优化后加速。
 
-## 数值验收仍有待评审
+## 数值验收状态
 
-FP16通过固定原 B06/B07/B08 矩阵，包含真实分页decode、混合batch、总长度
-4096及真实NCCL TP=2。BF16结论仍为失败：B06有1节点、B07有19比较、B08
-每rank有13个logits比较超限；新增跨dtype诊断也有失败，均保留在审核证据中。
-FP32残差累加改变低精度舍入，需约定精度契约。支持矩阵暂不修改，待精度评审、
-他人复现及对应平台验收完成后再声明支持。
+BF16 和 FP16 均在原冻结阈值、HF BF16 参考下通过 TP1 的全部591项，
+以及真实 NCCL TP2 每 rank 的1064项。两种精度、两种TP均通过六组 HTTP
+功能及六组性能条件各三次重复。BF16 TP2 数值复验在共享GPU的80页OOM后
+使用64页缓存，输入、长度和检查全部保留；双卡服务显式使用
+`--max-memory-utilization 0.99 --max-cache-size 536870912`，单卡保持默认。
+历史数值和资源失败保留在贡献证据中；以上为本机开发环境结果。
+混合精度策略仍需维护者评审和其他贡献者独立复现；
+支持模型矩阵暂不改为完整支持。
 
 ## 复现完整 checkpoint 数值验收
 
@@ -178,8 +195,12 @@ CUDA_VISIBLE_DEVICES=0 python tools/validate_olmo2_numerics.py hf-control \
 有1064项（比原 B08 扩展长序列覆盖）。缺数据、非有限值、形状及数值失败均
 返回非零退出码，报告保留全部失败；TP2 共享失败状态，运行异常直接传播，
 torchrun 负责终止整个 worker group。
+数值工具默认预分配80页；`--cache-blocks 64` 仅减少未使用的缓存预分配，
+最长增量历史与独立full参考各需32页且互不重叠。工具根据fixture计算完整矩阵
+容量要求，拒绝更小容量并记录实际页数；序列长度、decode步数、混合batch和
+数值阈值均不变。
 
-将两个验证命令的 dtype 改为 `bfloat16`，并使用不同输出目录，可重跑现存
-BF16 失败。`hf-control` 重跑未修改官方 eager BF16 的 cache/batch 与自身
+将两个验证命令的 dtype 改为 `bfloat16`，并使用不同输出目录，可重跑修复后的
+BF16 实现。`hf-control` 重跑未修改官方 eager BF16 的 cache/batch 与自身
 full-prefill 参考之间的差异，不据此豁免 xLLM 失败或改变冻结标准。
 自动隔离复现不能代替另一位贡献者的独立审核/复现。

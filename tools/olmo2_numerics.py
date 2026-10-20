@@ -34,7 +34,14 @@ class _Runner:
         self.device = model.device
         attn = model.model.layers[0].self_attn.attn
         self.backend = FlashInferBackend(
-            attn.num_heads, attn.num_kv_heads, attn.head_dim, attn.scale, 0, self.device, model.dtype
+            attn.num_heads,
+            attn.num_kv_heads,
+            attn.head_dim,
+            attn.scale,
+            0,
+            self.device,
+            model.dtype,
+            use_tensor_core_decode=attn.use_tensor_core_decode,
         )
         shape = (blocks, _BLOCK, attn.num_kv_heads, attn.head_dim)
         self.caches = [

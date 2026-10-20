@@ -429,6 +429,11 @@ class TestCreateAttentionBackend:
         with patch.dict(sys.modules, {module.__name__: module}):
             backend = _create_attention_backend(attn, torch.device("cuda"), torch.float16)
         assert isinstance(backend, StubAttentionBackend)
+        assert backend.init_kwargs["use_tensor_core_decode"] is None
+        attn.use_tensor_core_decode = True
+        with patch.dict(sys.modules, {module.__name__: module}):
+            backend = _create_attention_backend(attn, torch.device("cuda"), torch.bfloat16)
+        assert backend.init_kwargs["use_tensor_core_decode"] is True
 
 
 # ---------------------------------------------------------------------------
@@ -496,6 +501,12 @@ class TestModelExecutorConstruction:
     )
     def test_heterogeneous_attention_raises(self, _mock_backend):
         model = _FakeModelHeterogeneous()
+        with pytest.raises(ValueError, match="identical attention configuration"):
+            ModelExecutor(model, {}, max_seqs_per_batch=4)
+
+    def test_heterogeneous_decode_policy_raises(self) -> None:
+        model = _FakeModel(num_layers=2)
+        model.layers[1].use_tensor_core_decode = True
         with pytest.raises(ValueError, match="identical attention configuration"):
             ModelExecutor(model, {}, max_seqs_per_batch=4)
 

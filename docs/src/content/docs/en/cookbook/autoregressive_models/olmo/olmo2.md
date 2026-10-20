@@ -8,7 +8,9 @@ sidebar:
 
 This preview covers `allenai/OLMo-2-0425-1B-Instruct`, revision
 `48d788eca847d4d7548f375ad03d3c9312f6139e`, with the Python executor,
-FlashInfer paged attention, FP16, eager execution and TP=1/2. It depends on
+FlashInfer paged attention, FP16/BF16, eager execution and TP=1/2. Both compute
+dtypes passed the frozen numerical matrices and real HTTP service checks
+on the local CUDA setup. It depends on
 the OLMo2 C++ configuration loader (Z25, PR #2518). It is not a completed
 platform support announcement. NPU, quantization, graph execution and
 DP/CP/PP greater than one have not been accepted for this model.
@@ -19,8 +21,16 @@ intermediate size 8192, vocabulary size 100352 and a 4096-token context.
 Q/K RMSNorm spans the complete projection before head reshaping and RoPE.
 TP=2 sums separate FP32 Q/K squared statistics across ranks, then applies
 the sharded norm weights. Attention/MLP post-norm outputs are added to an
-FP32 residual stream; projection weights and KV cache retain FP16. The
-embedding and LM head are independent weights.
+FP32 residual stream; projection weights and KV cache retain the selected
+FP16/BF16 compute dtype. The embedding and LM head are independent weights.
+
+On CUDA BF16, FP32 projection inputs are split into a BF16 rounded value and
+a BF16 residual correction. Their two GEMMs produce FP32 outputs, summed
+before normalization; row-parallel reduction and LM-head logits also remain
+FP32. BF16 decode explicitly selects FlashInfer tensor cores. Weights and
+KV caches remain BF16. This mixed-precision policy adds GEMM work and FP32
+activation/communication memory; it is not pure BF16 arithmetic or a speedup
+claim. FP16 retains its existing projection and decode policy.
 
 ## Prepare a separate FP16 configuration
 
@@ -67,23 +77,34 @@ Transformers 5.12.1, FlashInfer 0.6.14 and TVM-FFI 0.1.13.
 ```bash
 export XLLM_BINARY=/path/to/built/xllm
 python tools/validate_olmo2_cuda.py \
-  --model "$OLMO2_FP16" --binary "$XLLM_BINARY" \
+  --model "$OLMO2_FP16" --binary "$XLLM_BINARY" --dtype float16 \
   --tp 1 --devices 0 --port 18000 --output /tmp/olmo2-tp1
 
 python tools/validate_olmo2_cuda.py \
-  --model "$OLMO2_FP16" --binary "$XLLM_BINARY" \
+  --model "$OLMO2_FP16" --binary "$XLLM_BINARY" --dtype float16 \
   --tp 2 --devices 0,1 --port 18000 --output /tmp/olmo2-tp2
 ```
+
+For BF16, use `--model "$OLMO2_SOURCE" --dtype bfloat16` instead of the
+FP16 config path. `--dtype` verifies the loaded configuration; it does not
+convert the checkpoint or override the server configuration.
 
 Use new output directories for each run. The tool starts and stops its own
 servers, saves commands, requests and SSE events, and fails on mismatches.
 TP=2 uses two local server processes with `--nnodes=2 --node_rank=0/1` and a
 shared rendezvous address. Exposing two GPUs to one server process alone
 does not create TP=2 in this engine revision. It checks the actual loaded
-TP topology and FP16 dtype, template token count, stream equivalence,
+TP topology and the requested compute dtype, template token count, stream equivalence,
 EOS/ignore_eos, explicit stop tokens/strings, length, invalid inputs and
 mixed-length concurrent isolation. These are service checks; they do not
 replace numerical comparison of logits.
+On a shared GPU, `--max-memory-utilization` and `--max-cache-size` expose
+the server's existing memory controls; defaults remain 0.4 and 1073741824
+bytes per rank. Check free memory before choosing them. Both effective values
+are saved with the launch and performance records. A smaller cache can add
+preemption/recomputation, so results with different capacities are not a
+controlled performance comparison. These options never change the requests
+or acceptance assertions.
 Every stream must report a finish reason and end with `[DONE]`; requested
 usage must also be present. Truncated chat streams and in-band errors fail
 acceptance even when all expected text has already arrived.
@@ -104,7 +125,7 @@ python -m pytest tests/python/test_olmo2.py tests/python/test_registry.py \
   tests/python/test_flashinfer_attention.py tests/python/test_validate_olmo2_cuda.py -q
 
 python tools/validate_olmo2_cuda.py \
-  --model "$OLMO2_FP16" --binary "$XLLM_BINARY" \
+  --model "$OLMO2_FP16" --binary "$XLLM_BINARY" --dtype float16 \
   --tp 1 --devices 0 --port 18000 --output /tmp/olmo2-benchmark \
   --benchmark --build-label "record your compiler flags here"
 ```
@@ -123,7 +144,7 @@ are development baselines, not release performance or a speedup claim.
 
 
 The local development run used two RTX 4090 devices reporting 48537 MiB each.
-The following are aggregate output throughput medians and ranges across three
+The following historical FP16 results are aggregate throughput medians and ranges across three
 repetitions; the raw requests are retained with the contribution evidence.
 These are separate TP baselines, not an optimization comparison.
 
@@ -151,16 +172,19 @@ and 544 separate Q/K sums. Numerous small Torch operations and conversions
 make CPU dispatch a follow-up investigation; no kernel optimization or
 post-optimization speedup is claimed.
 
-## Numerical acceptance still under review
+## Numerical validation status
 
-FP16 passed the fixed original B06/B07/B08 matrices, including real paged
-decode, mixed batches, total length 4096 and real NCCL TP=2. This does not
-establish BF16 correctness: the BF16 run still fails 1 B06 node, 19 B07
-comparisons and 13 B08 logits comparisons per rank. Additional cross-dtype
-diagnostics also have failures, retained in the review evidence. FP32
-residual accumulation changes low-precision rounding and needs an agreed
-precision contract. The supported-model matrix remains unchanged pending
-that review, independent reproduction and platform acceptance.
+BF16 and FP16 each pass 591 TP1 checks and 1064 checks on each of two real
+NCCL ranks, using unchanged frozen budgets and HF BF16 references. Each
+dtype also passes six HTTP functional groups and six benchmark conditions
+with three repetitions for both TP configurations. BF16 TP2 numerical
+validation used 64 physical cache pages after shared-GPU OOMs with 80; all
+inputs, lengths and checks were retained. Shared-GPU TP2 services used
+`--max-memory-utilization 0.99 --max-cache-size 536870912`; TP1 retained the
+default configuration. Earlier numerical and resource failures remain in
+the contribution evidence. These are development results on this setup.
+The mixed-precision policy still needs maintainer review and independent
+reproduction. The supported-model matrix remains unchanged.
 
 ## Reproduce full-checkpoint numerical acceptance
 
@@ -204,9 +228,15 @@ the original B08 length coverage. Missing data, non-finite values, shape errors
 and numeric failures cannot produce a successful exit code. Reports preserve
 all failures; TP2 shares a failing status across ranks. Runtime exceptions
 propagate and torchrun terminates the worker group.
+The numerical runner defaults to 80 physical cache pages. `--cache-blocks 64`
+removes unused preallocation while retaining the entire frozen matrix:
+the longest cached and independent full-reference histories each need 32
+disjoint pages. The tool computes the fixture's capacity requirement, rejects
+smaller allocations and records the actual page count. Sequence lengths,
+decode steps, mixed batches and numerical budgets remain unchanged.
 
 Repeat both validation commands with `--dtype bfloat16` and distinct output
-paths to retain the known failures. The `hf-control` command reproduces the
+paths to validate the revised BF16 implementation. The `hf-control` command reproduces the
 official eager BF16 cache/batch variation against its own full-prefill reference;
 it does not waive xLLM failures or change the frozen criteria. Actual automated
 reproduction is distinct from review/reproduction by another contributor.
