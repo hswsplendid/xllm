@@ -428,17 +428,6 @@ def main() -> None:
             if args.benchmark:
                 _ok("repeated-unprofiled-performance")
             _request("health-after-all", None)
-            logger.info("OLMo2 service acceptance passed: TP=%s, benchmark=%s", args.tp, args.benchmark)
-            _save(
-                out / "result.json",
-                dict(
-                    status="PASS",
-                    tp=args.tp,
-                    checks=checks,
-                    bench_groups=6 if args.benchmark else 0,
-                    repetitions=3 if args.benchmark else 0,
-                ),
-            )
         finally:
             for p in processes:
                 if p.poll() is None:
@@ -452,6 +441,23 @@ def main() -> None:
             for handle in extra_logs:
                 handle.close()
             _save(out / "shutdown.json", dict(stopped_own_server=True, exit_codes=[p.returncode for p in processes]))
+
+    # Publish success only after every owned rank has exited cleanly. A late
+    # crash or forced kill must not leave a successful acceptance artifact.
+    exit_codes = [p.returncode for p in processes]
+    if len(processes) != args.tp or any(code != 0 for code in exit_codes):
+        raise RuntimeError(f"OLMo2 server ranks did not exit cleanly: {exit_codes}")
+    _save(
+        out / "result.json",
+        dict(
+            status="PASS",
+            tp=args.tp,
+            checks=checks,
+            bench_groups=6 if args.benchmark else 0,
+            repetitions=3 if args.benchmark else 0,
+        ),
+    )
+    logger.info("OLMo2 service acceptance passed: TP=%s, benchmark=%s", args.tp, args.benchmark)
 
 
 if __name__ == "__main__":

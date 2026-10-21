@@ -233,3 +233,114 @@ def test_main_rejects_truncated_chat_stream_after_matching_all_text(
     saved = json.loads((tmp_path / "output/chat-stream.json").read_text())
     assert saved["result"]["text"] == "Hello" and saved["result"]["finish_reason"] is None
     assert not (tmp_path / "output/result.json").exists()
+
+
+@pytest.mark.parametrize("exit_codes", [(0,), (-11,), (0, 0), (0, -9)])
+def test_service_acceptance_requires_clean_exit_from_every_rank(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, exit_codes: tuple[int, ...]
+) -> None:
+    """A late rank failure must invalidate otherwise successful HTTP checks."""
+    binary = tmp_path / "xllm"
+    binary.write_bytes(b"test executable; never launched")
+    tokenizer = SimpleNamespace(
+        encode=lambda *args, **kwargs: [3],
+        decode=lambda *args, **kwargs: "Hello",
+        eos_token_id=2,
+        apply_chat_template=lambda *args, **kwargs: "chat",
+    )
+    monkeypatch.setattr(validation.AutoTokenizer, "from_pretrained", lambda *args, **kwargs: tokenizer)
+    monkeypatch.setattr(
+        validation.Tokenizer,
+        "from_file",
+        lambda *args, **kwargs: SimpleNamespace(encode=lambda *args, **kwargs: SimpleNamespace(ids=[3])),
+    )
+
+    class _Session:
+        trust_env = False
+
+        def __enter__(self) -> _Session:
+            return self
+
+        def __exit__(self, *args: Any) -> None:
+            pass
+
+        def get(self, *args: Any, **kwargs: Any) -> requests.Response:
+            response = requests.Response()
+            response.status_code = 200
+            response.encoding = "utf-8"
+            payload = kwargs.get("json")
+            if payload is None:
+                response._content = json.dumps({"data": [{"id": tmp_path.name}]}).encode()
+                return response
+            invalid = (
+                payload["model"] == "missing"
+                or payload["max_tokens"] < 0
+                or payload.get("prompt") == [100352]
+                or len(payload.get("prompt", [])) > 4096
+                or payload.get("messages") == []
+                or payload.get("stream_options", {}).get("include_usage") == "bad"
+            )
+            if invalid:
+                response.status_code = 400
+                response._content = b'{"error": "invalid request"}'
+                return response
+            stopped = "stop" in payload or "stop_token_ids" in payload or not payload["ignore_eos"]
+            count = 1 if stopped else payload["max_tokens"]
+            prompt_count = len(payload.get("prompt", [3]))
+            usage = dict(prompt_tokens=prompt_count, completion_tokens=count, total_tokens=prompt_count + count)
+            text = "" if "stop" in payload else "Hello"
+            choice = dict(text=text, message={"content": text}, finish_reason="stop" if stopped else "length")
+            body = {"choices": [choice], "usage": usage}
+            if payload.get("stream"):
+                response.raw = io.BytesIO(("data: " + json.dumps(body) + "\n\ndata: [DONE]\n\n").encode())
+            else:
+                response._content = json.dumps(body).encode()
+            return response
+
+        post = get
+
+    processes = []
+
+    def _server(*args: Any, stdout: Any, **kwargs: Any) -> SimpleNamespace:
+        rank = len(processes)
+        stdout.write(
+            f"Loaded 179 OLMo2 checkpoint tensors; tp_rank={rank}, tp_size={len(exit_codes)}, dtype=torch.float16\n"
+        )
+        stdout.flush()
+        process = SimpleNamespace(pid=123 + rank, returncode=None, poll=lambda: None)
+
+        def _wait(**kwargs: Any) -> int:
+            process.returncode = exit_codes[rank]
+            return exit_codes[rank]
+
+        process.wait = _wait
+        processes.append(process)
+        return process
+
+    monkeypatch.setattr(validation.requests, "Session", _Session)
+    monkeypatch.setattr(validation.subprocess, "Popen", _server)
+    monkeypatch.setattr(validation.os, "killpg", lambda *args: None)
+    output = tmp_path / "output"
+    monkeypatch.setattr(
+        validation.sys,
+        "argv",
+        [
+            "validate_olmo2_cuda.py",
+            "--model",
+            str(tmp_path),
+            "--binary",
+            str(binary),
+            "--output",
+            str(output),
+            "--tp",
+            str(len(exit_codes)),
+        ],
+    )
+    if any(exit_codes):
+        with pytest.raises(RuntimeError, match="server.*exit"):
+            validation.main()
+        assert not (output / "result.json").exists()
+    else:
+        validation.main()
+        assert json.loads((output / "result.json").read_text())["status"] == "PASS"
+    assert json.loads((output / "shutdown.json").read_text())["exit_codes"] == list(exit_codes)
