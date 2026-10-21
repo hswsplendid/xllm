@@ -9,8 +9,9 @@ sidebar:
 本预览针对 `allenai/OLMo-2-0425-1B-Instruct`，固定 revision
 `48d788eca847d4d7548f375ad03d3c9312f6139e`，使用 Python executor、
 FlashInfer 分页 attention、FP16/BF16、eager、TP=1/2。两种计算精度均已在
-本机 CUDA 环境通过冻结数值矩阵和真实 HTTP 验收。依赖 OLMo2 C++ 配置
-加载前置 Z25（PR #2518）。当前不是完整平台支持声明；NPU、量化、图执行
+本机 CUDA 环境通过冻结数值矩阵和真实 HTTP 验收。本次已完整包含原先在
+#2518（Z25）提交的 OLMo2 C++ 配置加载、字段校验、fixture 与测试，
+可作为一份完整实现审阅和合并。当前不是完整平台支持声明；NPU、量化、图执行
 以及大于1的 DP/CP/PP 尚未完成本模型验收。
 本次贡献目标为 NVIDIA CUDA；Ascend 适配是后续独立任务。
 
@@ -91,6 +92,8 @@ BF16 使用原始目录 `--model "$OLMO2_SOURCE" --dtype bfloat16`。
 不同容量的吞吐不能作受控性能对比。这些参数不改变请求或验收断言。
 所有流式响应必须带有结束原因并以 `[DONE]` 结束，请求了 usage 时还必须返回
 usage。即使完整文本已到达，截断的 chat 流或流内错误也不能通过验收。
+只有全部服务 rank 以退出码0结束后，工具才写入最终 PASS 结果。
+崩溃或强制终止不能通过验收，各 rank 退出码保存在 `shutdown.json`。
 
 工具保留调用者设置的 `FLASHINFER_CUDA_ARCH_LIST`；未设置时由 FlashInfer
 检测 GPU 架构，不会将 RTX4090 的架构强制应用到其他 NVIDIA GPU。
@@ -158,10 +161,12 @@ kernel优化，也没有声明优化后加速。
 ## 数值验收状态
 
 BF16 和 FP16 均在原冻结阈值、HF BF16 参考下通过 TP1 的全部591项，
-以及真实 NCCL TP2 每 rank 的1064项。两种精度、两种TP均通过六组 HTTP
+以及真实 NCCL TP2 每 rank 的1064项。两种精度、两种TP均通过七组 HTTP
 功能及六组性能条件各三次重复。变基到 main `b6123035` 后，匹配的 Release/O3
-产物再次通过完整矩阵：数值测试使用80页缓存，全部 HTTP rank 使用工具默认
-`--max-memory-utilization 0.4 --max-cache-size 1073741824`。
+产物再次通过完整矩阵：数值测试使用80页缓存，最终 HTTP 使用
+TP1 `--max-memory-utilization 0.4`、TP2 `0.99`，全部 rank 均使用
+`--max-cache-size 1073741824`。首次TP2按0.4配额启动，在共享GPU负载下
+于ready前失败，原始失败记录保留。
 本轮数值运行开始时两卡均可用；此前共享卡运行需要64页和更小的 HTTP cache
 上限，资源失败与成功重试均保留在贡献证据中。结果适用于本机 CUDA 环境，
 不据此声明性能提升。

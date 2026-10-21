@@ -10,8 +10,10 @@ This preview covers `allenai/OLMo-2-0425-1B-Instruct`, revision
 `48d788eca847d4d7548f375ad03d3c9312f6139e`, with the Python executor,
 FlashInfer paged attention, FP16/BF16, eager execution and TP=1/2. Both compute
 dtypes passed the frozen numerical matrices and real HTTP service checks
-on the local CUDA setup. It depends on
-the OLMo2 C++ configuration loader (Z25, PR #2518). It is not a completed
+on the local CUDA setup. This contribution includes the OLMo2 C++
+configuration loader, field validation, fixtures and tests originally
+submitted in #2518 (Z25); it can be reviewed and merged as one implementation.
+It is not a completed
 platform support announcement. NPU, quantization, graph execution and
 DP/CP/PP greater than one have not been accepted for this model.
 This contribution targets NVIDIA CUDA. Ascend adaptation is a separate task.
@@ -108,6 +110,9 @@ or acceptance assertions.
 Every stream must report a finish reason and end with `[DONE]`; requested
 usage must also be present. Truncated chat streams and in-band errors fail
 acceptance even when all expected text has already arrived.
+The tool writes its final PASS result only after every server rank exits
+with code zero. A crash or forced shutdown fails acceptance, and the rank
+exit codes are retained in `shutdown.json`.
 
 The tool preserves `FLASHINFER_CUDA_ARCH_LIST` when set by the caller;
 otherwise FlashInfer detects the GPU architecture. It does not force the
@@ -188,11 +193,13 @@ post-optimization speedup is claimed.
 
 BF16 and FP16 each pass 591 TP1 checks and 1064 checks on each of two real
 NCCL ranks, using unchanged frozen budgets and HF BF16 references. Each
-dtype also passes six HTTP functional groups and six benchmark conditions
+dtype also passes seven HTTP functional groups and six benchmark conditions
 with three repetitions for both TP configurations. Revalidation on main
 `b6123035` with matching Release/O3 artifacts passed this complete matrix
-using 80 physical cache pages for numerical tests and the HTTP tool defaults
-of `--max-memory-utilization 0.4 --max-cache-size 1073741824` for every rank.
+using 80 physical cache pages for numerical tests. The final HTTP runs used
+`--max-memory-utilization 0.4` for TP1 and `0.99` for TP2, with
+`--max-cache-size 1073741824` for every rank. The first TP2 startup at 0.4
+failed before readiness under shared-GPU load; that failure was retained.
 Both GPUs were available when these numerical runs started. Earlier shared-GPU
 runs needed 64 pages and a smaller HTTP cache cap; those resource failures and
 successful retries remain in the contribution evidence. These results apply
