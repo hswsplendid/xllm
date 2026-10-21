@@ -430,10 +430,14 @@ class TestCreateAttentionBackend:
             backend = _create_attention_backend(attn, torch.device("cuda"), torch.float16)
         assert isinstance(backend, StubAttentionBackend)
         assert backend.init_kwargs["use_tensor_core_decode"] is None
+        assert backend.init_kwargs["kv_cache_storage_head_dim"] == 0
         attn.use_tensor_core_decode = True
         with patch.dict(sys.modules, {module.__name__: module}):
-            backend = _create_attention_backend(attn, torch.device("cuda"), torch.bfloat16)
+            backend = _create_attention_backend(
+                attn, torch.device("cuda"), torch.bfloat16, {"kv_cache_storage_head_dim": 256}
+            )
         assert backend.init_kwargs["use_tensor_core_decode"] is True
+        assert backend.init_kwargs["kv_cache_storage_head_dim"] == 256
 
 
 # ---------------------------------------------------------------------------
