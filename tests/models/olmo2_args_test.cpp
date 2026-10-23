@@ -274,6 +274,61 @@ TEST_F(Olmo2ArgsTest, LoadsExplicitOptionalValuesAndDtypeAlias) {
   EXPECT_EQ(args.dtype(), "float16");
 }
 
+TEST_F(Olmo2ArgsTest, RejectsEmptyDtypeAliases) {
+  nlohmann::json original = config_;
+  original.erase("torch_dtype");
+  original.erase("dtype");
+  for (const nlohmann::json& patch :
+       {nlohmann::json{{"torch_dtype", ""}},
+        nlohmann::json{{"dtype", ""}},
+        nlohmann::json{{"torch_dtype", ""}, {"dtype", nullptr}},
+        nlohmann::json{{"torch_dtype", nullptr}, {"dtype", ""}},
+        nlohmann::json{{"torch_dtype", "bfloat16"}, {"dtype", ""}},
+        nlohmann::json{{"torch_dtype", ""}, {"dtype", "float16"}},
+        nlohmann::json{{"torch_dtype", ""}, {"dtype", ""}}}) {
+    SCOPED_TRACE(patch.dump());
+    config_ = original;
+    config_.update(patch);
+    ModelArgs args;
+    args.model_type("unchanged");
+    args.hidden_size(777);
+    args.dtype("float32");
+    EXPECT_FALSE(load(&args));
+    EXPECT_EQ(args.model_type(), "unchanged");
+    EXPECT_EQ(args.hidden_size(), 777);
+    EXPECT_EQ(args.dtype(), "float32");
+  }
+}
+
+TEST_F(Olmo2ArgsTest, AcceptsAbsentAndNullDtypeAliases) {
+  nlohmann::json original = config_;
+  original.erase("torch_dtype");
+  original.erase("dtype");
+  for (const nlohmann::json& patch :
+       {nlohmann::json::object(),
+        nlohmann::json{{"torch_dtype", nullptr}},
+        nlohmann::json{{"dtype", nullptr}},
+        nlohmann::json{{"torch_dtype", nullptr}, {"dtype", nullptr}}}) {
+    SCOPED_TRACE(patch.dump());
+    config_ = original;
+    config_.update(patch);
+    ModelArgs args;
+    ASSERT_TRUE(load(&args));
+    EXPECT_TRUE(args.dtype().empty());
+  }
+  for (const char* dtype : {"float16", "bfloat16", "float32"}) {
+    for (const char* field : {"torch_dtype", "dtype"}) {
+      SCOPED_TRACE(std::string(field) + "=" + dtype);
+      config_ = original;
+      config_.update({{"torch_dtype", nullptr}, {"dtype", nullptr}});
+      config_[field] = dtype;
+      ModelArgs args;
+      ASSERT_TRUE(load(&args));
+      EXPECT_EQ(args.dtype(), dtype);
+    }
+  }
+}
+
 TEST_F(Olmo2ArgsTest, AcceptsNullableSpecialTokens) {
   for (const char* field : {"bos_token_id", "pad_token_id", "eos_token_id"}) {
     config_[field] = nullptr;
