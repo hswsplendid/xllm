@@ -330,6 +330,66 @@ TEST_F(Olmo2ArgsTest, CanonicalRopeTypeOverridesLegacyAlias) {
   EXPECT_FALSE(load(&args));
 }
 
+TEST_F(Olmo2ArgsTest, RejectsNestedScalingFieldsWithoutScaledType) {
+  const nlohmann::json scaling_fields = {
+      {"factor", 2.0},
+      {"short_factor", std::vector<double>(64, 1.0)},
+      {"long_factor", std::vector<double>(64, 2.0)},
+      {"original_max_position_embeddings", 2048}};
+  // Neither an omitted type nor a canonical default may erase scaling data.
+  for (const nlohmann::json& parameters :
+       {nlohmann::json::object(),
+        nlohmann::json{{"type", "default"}},
+        nlohmann::json{{"rope_type", "default"}},
+        nlohmann::json{{"type", "longrope"}, {"rope_type", "default"}}}) {
+    for (const auto& [field, value] : scaling_fields.items()) {
+      SCOPED_TRACE(parameters.dump() + ":" + field);
+      config_["rope_parameters"] = parameters;
+      config_["rope_parameters"][field] = value;
+      ModelArgs args;
+      args.model_type("unchanged");
+      args.hidden_size(777);
+      args.rope_theta(12345.0f);
+      EXPECT_FALSE(load(&args));
+      EXPECT_EQ(args.model_type(), "unchanged");
+      EXPECT_EQ(args.hidden_size(), 777);
+      EXPECT_FLOAT_EQ(args.rope_theta(), 12345.0f);
+    }
+  }
+}
+
+TEST_F(Olmo2ArgsTest, AcceptsNullNestedScalingFields) {
+  config_["rope_parameters"] = {{"type", "longrope"},
+                                {"rope_type", "default"},
+                                {"rope_theta", 750000},
+                                {"factor", nullptr},
+                                {"short_factor", nullptr},
+                                {"long_factor", nullptr},
+                                {"original_max_position_embeddings", nullptr}};
+  ModelArgs args;
+  ASSERT_TRUE(load(&args));
+  EXPECT_FLOAT_EQ(args.rope_theta(), 750000.0f);
+}
+
+TEST_F(Olmo2ArgsTest, RejectsMalformedNestedScalingFields) {
+  // Empty/zero values are still explicitly supplied unsupported parameters.
+  for (const char* field : {"factor",
+                            "short_factor",
+                            "long_factor",
+                            "original_max_position_embeddings"}) {
+    for (const nlohmann::json& value : {nlohmann::json(0),
+                                        nlohmann::json(false),
+                                        nlohmann::json(""),
+                                        nlohmann::json::array(),
+                                        nlohmann::json::object()}) {
+      SCOPED_TRACE(std::string(field) + "=" + value.dump());
+      config_["rope_parameters"] = {{"rope_type", "default"}, {field, value}};
+      ModelArgs args;
+      EXPECT_FALSE(load(&args));
+    }
+  }
+}
+
 TEST_F(Olmo2ArgsTest, LoadsMultipleEosTokens) {
   config_["eos_token_id"] = {100257, 100278};
   ModelArgs args;
