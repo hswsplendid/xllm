@@ -125,10 +125,20 @@ REGISTER_MODEL_ARGS_LOADER(olmo2, [](const JsonReader& json, ModelArgs* args) {
       !read("rope_parameters.rope_theta", &parsed.rope_theta()) ||
       !read("tie_word_embeddings", &parsed.tie_word_embeddings()) ||
       !read("attention_bias", &parsed.attention_bias()) ||
-      !read("attention_dropout", &parsed.attention_dropout()) ||
-      !read("torch_dtype", &parsed.dtype()) ||
-      !read("dtype", &parsed.dtype())) {
+      !read("attention_dropout", &parsed.attention_dropout())) {
     return false;
+  }
+  // Only absent/null aliases mean unspecified; explicit empty strings are
+  // invalid.
+  for (const char* key : {"torch_dtype", "dtype"}) {
+    const auto* node = json.resolve(key);
+    if (node == nullptr || node->is_null()) {
+      continue;
+    }
+    if (!read(key, &parsed.dtype()) || parsed.dtype().empty()) {
+      LOG(ERROR) << "Invalid OLMo2 dtype field: " << key;
+      return false;
+    }
   }
   if (parsed.hidden_act().empty() || parsed.rms_norm_eps() <= 0 ||
       parsed.rope_theta() <= 0 || parsed.attention_dropout() < 0 ||

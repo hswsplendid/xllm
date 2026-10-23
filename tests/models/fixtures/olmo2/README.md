@@ -25,7 +25,7 @@ network access, or device initialization. They exercise the production
 | `rope_parameters.rope_theta` | `rope_theta` | Optional newer format; takes precedence over legacy theta |
 | `rope_parameters.type`, `rope_parameters.rope_type` | Unscaled RoPE validation | Legacy `type` fallback, canonical `rope_type` takes precedence; missing: `default`; non-default types or non-null scaling fields are rejected |
 | `rope_scaling` | No scaling fields set | Missing/null means unscaled RoPE; non-null is explicitly rejected |
-| `torch_dtype`, `dtype` | `dtype` | Empty means unspecified; non-null `dtype` takes precedence |
+| `torch_dtype`, `dtype` | `dtype` | Missing/null aliases leave dtype unspecified; non-null `dtype` takes precedence; explicit empty strings are rejected |
 | `tie_word_embeddings` | `tie_word_embeddings` | `false` |
 | `attention_bias` | `attention_bias`, `qkv_bias` | `false` |
 | `attention_dropout` | `attention_dropout` | `0` |
@@ -40,7 +40,10 @@ divisible by query heads; KV heads must divide query heads; explicit head
 dimension must match the derived, even RoPE dimension. Token IDs must fit the
 vocabulary and int32 (`-1` represents an absent scalar token). Norm epsilon and
 RoPE theta must be finite and positive; dropout is in `[0, 1)`. Explicit dtypes
-are `float16`, `bfloat16`, and `float32`.
+are `float16`, `bfloat16`, and `float32`. An explicit empty string in either dtype
+alias is invalid, even when the other alias is valid. Missing/null aliases do not
+override a valid value; when both are absent/null, the output dtype stays empty
+(unspecified).
 
 RoPE type validation includes the legacy `type` alias even when no `factor` is
 present. Nested `factor`, `short_factor`, `long_factor`, and
