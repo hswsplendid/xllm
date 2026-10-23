@@ -148,12 +148,19 @@ REGISTER_MODEL_ARGS_LOADER(olmo2, [](const JsonReader& json, ModelArgs* args) {
   if (rope_parameters != nullptr && !rope_parameters->is_null()) {
     std::string rope_type = "default";
     // Match Transformers: the canonical rope_type overrides the legacy type.
+    // A default type must not silently discard explicitly supplied scaling.
     if (!rope_parameters->is_object() ||
         !read("rope_parameters.type", &rope_type) ||
         !read("rope_parameters.rope_type", &rope_type) ||
         rope_type != "default" ||
         (rope_parameters->contains("factor") &&
-         !rope_parameters->at("factor").is_null())) {
+         !rope_parameters->at("factor").is_null()) ||
+        (rope_parameters->contains("short_factor") &&
+         !rope_parameters->at("short_factor").is_null()) ||
+        (rope_parameters->contains("long_factor") &&
+         !rope_parameters->at("long_factor").is_null()) ||
+        (rope_parameters->contains("original_max_position_embeddings") &&
+         !rope_parameters->at("original_max_position_embeddings").is_null())) {
       LOG(ERROR) << "OLMo2 config loader requires unscaled rope_parameters";
       return false;
     }

@@ -23,7 +23,7 @@ network access, or device initialization. They exercise the production
 | `rms_norm_eps` | `rms_norm_eps` | `1e-5` |
 | `rope_theta` | `rope_theta` | `10000` |
 | `rope_parameters.rope_theta` | `rope_theta` | Optional newer format; takes precedence over legacy theta |
-| `rope_parameters.type`, `rope_parameters.rope_type` | Unscaled RoPE validation | Legacy `type` fallback, canonical `rope_type` takes precedence; missing: `default`; non-default types or a scaling factor are rejected |
+| `rope_parameters.type`, `rope_parameters.rope_type` | Unscaled RoPE validation | Legacy `type` fallback, canonical `rope_type` takes precedence; missing: `default`; non-default types or non-null scaling fields are rejected |
 | `rope_scaling` | No scaling fields set | Missing/null means unscaled RoPE; non-null is explicitly rejected |
 | `torch_dtype`, `dtype` | `dtype` | Empty means unspecified; non-null `dtype` takes precedence |
 | `tie_word_embeddings` | `tie_word_embeddings` | `false` |
@@ -43,8 +43,13 @@ RoPE theta must be finite and positive; dropout is in `[0, 1)`. Explicit dtypes
 are `float16`, `bfloat16`, and `float32`.
 
 RoPE type validation includes the legacy `type` alias even when no `factor` is
-present. LongRoPE can derive scaling from context lengths without that field;
-accepting it as default RoPE would silently lose the checkpoint's semantics.
+present. Nested `factor`, `short_factor`, `long_factor`, and
+`original_max_position_embeddings` must be absent or null, including when the
+type is omitted or explicitly `default`. Non-null values, even zero or empty
+arrays, are rejected. LongRoPE can derive scaling from context lengths without
+`factor`; accepting these parameters as default RoPE would silently lose the
+checkpoint's semantics. A rejected configuration leaves the caller's output
+unchanged.
 
 `use_cache` is a reference execution setting, not an xLLM cache prohibition.
 The loader does not register any runtime factory or establish inference support.
