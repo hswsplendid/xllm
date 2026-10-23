@@ -6,6 +6,8 @@ cc_library(
   HDRS
     adaptive_speculative_controller.h
     dspark/dspark_budget_planner.h
+    dspark/dspark_graph_controller.h
+    dspark/dspark_runtime_cost_model.h
     dspark/dspark_adaptive_cost_cache.h
     dspark/dspark_sps_cost_model.h
     dspark/dspark_window_collector.h
@@ -26,6 +28,8 @@ cc_library(
   SRCS
     adaptive_speculative_controller.cpp
     dspark/dspark_budget_planner.cpp
+    dspark/dspark_graph_controller.cpp
+    dspark/dspark_runtime_cost_model.cpp
     dspark/dspark_adaptive_cost_cache.cpp
     dspark/dspark_sps_cost_model.cpp
     dspark/dspark_window_collector.cpp

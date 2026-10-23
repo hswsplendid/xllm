@@ -91,14 +91,16 @@ bool should_profile_legacy_speculative_validate(
       enable_task_pipeline && SpeculativeConfig::is_dspark_algorithm(algorithm);
   return speculative_config.enable_adaptive_speculative_decode() &&
          speculative_config.num_speculative_tokens() > 1 && is_supported_algo &&
-         !uses_dspark_pipeline;
+         !uses_dspark_pipeline &&
+         speculative_config.adaptive_speculative_cost_model() == "linear";
 }
 namespace {
 
 void configure_profile_sampling(RequestSamplingParam& sampling,
                                 const SpeculativeConfig& speculative_config,
                                 bool enable_task_pipeline) {
-  if (enable_task_pipeline &&
+  if ((enable_task_pipeline ||
+       speculative_config.adaptive_speculative_cost_model() != "linear") &&
       speculative_config.enable_adaptive_speculative_decode() &&
       SpeculativeConfig::is_dspark_algorithm(
           speculative_config.speculative_algorithm())) {

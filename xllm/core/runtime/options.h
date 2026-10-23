@@ -89,6 +89,8 @@ struct Options {
 
   PROPERTY(double, adaptive_speculative_min_gain) = 0.0;
 
+  PROPERTY(std::string, adaptive_speculative_cost_model) = "linear";
+
   PROPERTY(std::string, adaptive_dspark_cost_table);
   PROPERTY(std::string, adaptive_dspark_calibration);
 

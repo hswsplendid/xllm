@@ -52,3 +52,23 @@ cc_test(
     "${PROJECT_SOURCE_DIR}/xllm/core/framework/speculative/dspark/dspark_budget_planner.cpp"
   DEPS GTest::gtest_main
 )
+
+cc_test(
+  NAME dspark_graph_controller_test
+  NO_NPU_RUNTIME
+  SRCS
+    dspark_graph_controller_test.cpp
+    "${PROJECT_SOURCE_DIR}/xllm/core/framework/speculative/dspark/dspark_graph_controller.cpp"
+    "${PROJECT_SOURCE_DIR}/xllm/core/framework/speculative/dspark/dspark_budget_planner.cpp"
+  DEPS GTest::gtest_main
+)
+
+cc_test(
+  NAME dspark_runtime_cost_model_test
+  NO_NPU_RUNTIME
+  SRCS
+    dspark_runtime_cost_model_test.cpp
+    "${PROJECT_SOURCE_DIR}/xllm/core/framework/speculative/dspark/dspark_runtime_cost_model.cpp"
+    "${PROJECT_SOURCE_DIR}/xllm/core/framework/speculative/dspark/dspark_budget_planner.cpp"
+  DEPS GTest::gtest_main
+)

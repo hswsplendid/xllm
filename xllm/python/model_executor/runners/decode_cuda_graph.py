@@ -15,12 +15,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from statistics import median
 
 import torch
 import torch.nn as nn
 
 from xllm.python import kernels
-from xllm.python.attention.backend import AttentionBackend, AttentionMetadata
+from xllm.python.attention.backend import AttentionBackend, AttentionMetadata, LayerCache
 from xllm.python.model_executor.forward_context import (
     EplbRuntimeState,
     ForwardContext,
@@ -46,7 +47,7 @@ def _decode_bucket(batch_size: int) -> int:
 
 def _decode_graph_buckets(max_batch: int, dp_size: int) -> list[int]:
     max_local_batch = (max_batch + dp_size - 1) // dp_size
-    max_graph_batch = min(_decode_bucket(max_local_batch), max_batch)
+    max_graph_batch = _decode_bucket(max_local_batch)
     buckets = [size for size in (1, 2, 4, 8) if size <= max_graph_batch]
     buckets.extend(range(16, max_graph_batch + 1, 16))
     return buckets
@@ -96,6 +97,7 @@ class DecodeCudaGraphRunner(BaseRunner):
         max_model_len: int,
         dp_size: int = 1,
         dp_rank: int = 0,
+        profile_graph_costs: bool = False,
     ) -> None:
         super().__init__(model, attention_backend, device)
         if dp_size <= 0:
@@ -110,6 +112,17 @@ class DecodeCudaGraphRunner(BaseRunner):
         self._paged_kv_indices_buffer: torch.Tensor | None = None
         self._stream: torch.cuda.Stream | None = None
         self._warmed_up = False
+        self._profile_graph_costs = profile_graph_costs
+        self._graph_costs: dict[int, float] = {}
+        self._uses_linear_state = False
+
+    def bind_layer_caches(self, layer_caches: list[LayerCache]) -> None:
+        super().bind_layer_caches(layer_caches)
+        self._uses_linear_state = any(cache.conv is not None or cache.ssm is not None for cache in layer_caches)
+
+    def graph_costs(self) -> list[tuple[int, float]]:
+        """Return startup replay milliseconds for the actually captured buckets."""
+        return sorted(self._graph_costs.items())
 
     def can_execute(
         self,
@@ -148,6 +161,9 @@ class DecodeCudaGraphRunner(BaseRunner):
                 kv_cu_seq_lens=torch.arange(batch_size + 1, dtype=torch.int32, device=device),
                 dp_execution_token_counts=(batch_size,) * self.dp_size,
                 dp_is_decode=(1,) * self.dp_size,
+                linear_state_indices=(
+                    torch.zeros(batch_size, dtype=torch.int32, device=device) if self._uses_linear_state else None
+                ),
             )
             input_ids = torch.zeros(batch_size, dtype=torch.int32, device=device)
             positions = torch.zeros(batch_size, dtype=torch.int32, device=device)
@@ -161,6 +177,9 @@ class DecodeCudaGraphRunner(BaseRunner):
                 metadata,
                 graph_key[1],
             )
+            # Every bucket allocates/initializes tensors on the caller stream.
+            # Waiting only before the loop races those later initializations.
+            self._stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(self._stream):
                 self._fill_entry(entry, input_ids, positions, metadata, batch_size)
                 self.attention_backend.prepare(entry.static_metadata, graph_mode=True)
@@ -176,10 +195,25 @@ class DecodeCudaGraphRunner(BaseRunner):
                     )
                 ):
                     self._capture(entry)
+                    if self._profile_graph_costs:
+                        self._graph_costs[batch_size] = self._profile_entry(entry)
             self._graphs[graph_key] = entry
 
         torch.cuda.current_stream().wait_stream(self._stream)
         self._warmed_up = True
+
+    def _profile_entry(self, entry: _DecodeGraphEntry) -> float:
+        samples: list[float] = []
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        for _ in range(5):
+            start.record()
+            for _ in range(5):
+                entry.graph.replay()
+            end.record()
+            end.synchronize()
+            samples.append(start.elapsed_time(end) / 5)
+        return median(samples)
 
     def execute(
         self,
@@ -286,7 +320,7 @@ class DecodeCudaGraphRunner(BaseRunner):
             page_size = self.attention_backend.page_size
             max_blocks_per_sequence = (self.max_model_len + page_size - 1) // page_size
             self._paged_kv_indices_buffer = torch.zeros(
-                self.max_batch * max_blocks_per_sequence,
+                _decode_graph_buckets(self.max_batch, self.dp_size)[-1] * max_blocks_per_sequence,
                 dtype=metadata.paged_kv_indices.dtype,
                 device=device,
             )
@@ -342,6 +376,9 @@ class DecodeCudaGraphRunner(BaseRunner):
         static_metadata = entry.static_metadata
         if metadata.kv_cu_seq_lens is None:
             raise RuntimeError("decode CUDA graph requires device cumulative KV lengths")
+        linear_state_indices = getattr(metadata, "linear_state_indices", None)
+        if self._uses_linear_state and (linear_state_indices is None or linear_state_indices.numel() != batch_size):
+            raise ValueError("linear-state CUDA graphs require one state index per query row")
         graph_positions = positions.to(torch.int32).contiguous()
         kernels.update_decode_graph_metadata(
             input_ids,
@@ -361,11 +398,12 @@ class DecodeCudaGraphRunner(BaseRunner):
             static_metadata.paged_kv_last_page_len,
             padded_batch_size,
         )
-        linear_state_indices = getattr(metadata, "linear_state_indices", None)
-        if linear_state_indices is not None:
+        # Full-attention speculative verification expands query rows while
+        # generic request metadata retains one state index per request.
+        if self._uses_linear_state:
             static_metadata.linear_state_indices[:batch_size].copy_(linear_state_indices)
-        if padded_batch_size > batch_size:
-            static_metadata.linear_state_indices[batch_size:].zero_()
+            if padded_batch_size > batch_size:
+                static_metadata.linear_state_indices[batch_size:].zero_()
         self._fill_host_metadata(entry, metadata, batch_size)
 
     def _fill_host_metadata(

@@ -20,13 +20,15 @@ limitations under the License.
 
 #include <cstdint>
 #include <memory>
+#include <vector>
 
 #include "common/macros.h"
+#include "core/framework/speculative/dspark/dspark_budget_planner.h"
 #include "core/kv_cache/storage/kv_cache.h"
-#include "executor_impl_factory.h"
 #include "framework/model/causal_lm.h"
 #include "framework/model/model_params_view.h"
 #include "runtime/executor_impl.h"
+#include "runtime/executor_impl_factory.h"
 #include "runtime/options.h"
 
 namespace xllm {
@@ -45,6 +47,8 @@ class __attribute__((visibility("hidden"))) PyExecutorImpl final
                  const runtime::Options& options);
 
   ~PyExecutorImpl() override;
+
+  std::vector<DSparkGraphCost> decode_graph_costs() const;
 
   bool supports_prepared_attention_metadata() const override {
     return supports_prepared_metadata_;

@@ -550,7 +550,12 @@ ffi::Function get_function(const std::string& uri,
     return it->second;
   }
   VLOG(10) << "get_function:  uri: " << uri << " func_name: " << func_name;
-  auto func_opt = get_module(uri)->GetFunction(func_name);
+  auto module = get_module(uri);
+  // The packed boundary avoids an Optional C++ return-layout mismatch when
+  // embedded Python loads a different compatible TVM FFI runtime.
+  auto lookup = ffi::Function::GetGlobalRequired("ffi.ModuleGetFunction");
+  auto func_opt = lookup(module, func_name, /*query_imports=*/false)
+                      .cast<ffi::Optional<ffi::Function>>();
   if (!func_opt.defined()) {
     LOG(FATAL) << "TVM function not found. uri=" << uri
                << " func_name=" << func_name

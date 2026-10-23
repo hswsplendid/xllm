@@ -351,7 +351,7 @@ class RecordingProfileEngine final : public Engine {
         // Follow the real request-to-sampler conversion rather than assuming
         // the presence of a per-row sampling tensor implies greedy admission.
         SamplingParameters sampling;
-        sampling.init({sequence->sampling_param()}, {0}, {0}, {}, {}, {});
+        sampling.init({sequence->sampling_param()}, {0}, {}, {}, {});
         observed_greedy_samples_.emplace_back(sampling.sampling_mode ==
                                                   SamplingMode::GREEDY &&
                                               !sampling.do_sample.defined());
@@ -1147,6 +1147,37 @@ TEST(GraphWarmupTest, ElasticGraphWarmupCannotBeDeferredToServing) {
 #else
   GTEST_SKIP() << "Startup warmup requires a device execution platform.";
 #endif
+}
+
+TEST(SpeculativeValidateProfileGateTest, CudaGraphPoliciesSkipLegacyCostSweep) {
+  SpeculativeConfig speculative;
+  speculative.enable_adaptive_speculative_decode(true)
+      .num_speculative_tokens(7)
+      .speculative_algorithm("DSpark");
+  for (const std::string mode : {"graph", "graph_feedback", "graph_shadow"}) {
+    speculative.adaptive_speculative_cost_model(mode);
+    EXPECT_FALSE(should_profile_legacy_speculative_validate(
+        speculative, /*enable_task_pipeline=*/false));
+  }
+  speculative.adaptive_speculative_cost_model("linear");
+  EXPECT_TRUE(should_profile_legacy_speculative_validate(
+      speculative, /*enable_task_pipeline=*/false));
+}
+
+TEST(SpeculativeValidateProfileGateTest,
+     CudaGraphRejectsAlternateVerificationGeometry) {
+  SpeculativeConfig speculative;
+  speculative.enable_adaptive_speculative_decode(true)
+      .num_speculative_tokens(7)
+      .speculative_algorithm("DSpark")
+      .draft_sampling_mode("greedy")
+      .adaptive_speculative_cost_model("graph");
+  speculative.validate();
+  speculative.enable_atb_spec_kernel(true);
+  EXPECT_DEATH(speculative.validate(), "ATB verification");
+  speculative.enable_atb_spec_kernel(false).adaptive_dspark_cost_table_output(
+      "unused-cost-table.json");
+  EXPECT_DEATH(speculative.validate(), "task-pipeline calibration");
 }
 
 }  // namespace

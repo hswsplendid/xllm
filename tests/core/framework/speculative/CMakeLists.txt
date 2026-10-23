@@ -1,6 +1,27 @@
 include(cc_test)
+include(cc_binary)
 
 add_subdirectory(dspark)
+
+cc_binary(
+  NAME
+    dspark_graph_policy_benchmark
+  SRCS
+    "${PROJECT_SOURCE_DIR}/tools/benchmark_dspark_graph_policy.cpp"
+    "${PROJECT_SOURCE_DIR}/xllm/core/framework/speculative/adaptive_speculative_controller.cpp"
+    "${PROJECT_SOURCE_DIR}/xllm/core/framework/speculative/speculative_profile_registry.cpp"
+    "${PROJECT_SOURCE_DIR}/xllm/core/framework/speculative/dspark/dspark_budget_planner.cpp"
+    "${PROJECT_SOURCE_DIR}/xllm/core/framework/speculative/dspark/dspark_graph_controller.cpp"
+    "${PROJECT_SOURCE_DIR}/xllm/core/framework/speculative/dspark/dspark_runtime_cost_model.cpp"
+  DEPS
+    torch
+    glog::glog
+    proto::xllm_proto
+)
+target_compile_definitions(dspark_graph_policy_benchmark PRIVATE XLLM_BENCHMARK_TORCH)
+target_include_directories(dspark_graph_policy_benchmark PRIVATE
+  "${PROJECT_SOURCE_DIR}/xllm"
+  "${PROJECT_SOURCE_DIR}/xllm/core")
 
 cc_test(
   NAME

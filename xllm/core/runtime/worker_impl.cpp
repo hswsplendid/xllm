@@ -2527,14 +2527,20 @@ bool WorkerImpl::init_model(const std::string& model_weights_path,
     args.num_speculative_tokens(options_.num_speculative_tokens());
     if (is_block_diffusion) {
       if (options_.is_draft_engine()) {
-        LOG(FATAL) << speculative_algorithm
-                   << " block-diffusion draft is not supported on "
-                   << Platform::type_str() << ".";
+        CHECK(Platform::is_cuda() &&
+              ModelConfig::is_python_model_impl(
+                  ModelConfig::get_instance().model_impl()) &&
+              SpeculativeConfig::is_dspark_algorithm(speculative_algorithm) &&
+              args.model_type() == "qwen3")
+            << "CUDA block-diffusion drafts require Python Qwen3 DSpark.";
+        args.layers_to_capture({});
+        args.model_type("DSparkDraftModel");
+      } else {
+        CHECK(options_.draft_model_path().has_value())
+            << "block-diffusion speculative decoding requires --draft_model.";
+        args.layers_to_capture(
+            read_capture_layer_ids(options_.draft_model_path().value()));
       }
-      CHECK(options_.draft_model_path().has_value())
-          << "block-diffusion speculative decoding requires --draft_model.";
-      args.layers_to_capture(
-          read_capture_layer_ids(options_.draft_model_path().value()));
     }
     // When running speculative decoding, the draft worker reuses the same
     // checkpoint as the target model. The draft worker needs to instantiate

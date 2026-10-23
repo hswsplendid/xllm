@@ -436,6 +436,65 @@ TEST_F(LLMRequestFactoryTest, FactoryAddsStopSequenceVariants) {
   check_generated_token(kNonStopToken, FinishReason::NONE);
 }
 
+TEST_F(LLMRequestFactoryTest, GraphAwareRejectsRandomBeforeExecution) {
+  options_.adaptive_speculative_cost_model("graph");
+  auto factory = make_factory();
+  CallbackCapture capture;
+  RequestParams sp;
+  sp.temperature = 0.7F;
+  auto request = factory->create(
+      /*prompt=*/"hello world",
+      /*prompt_tokens=*/std::nullopt,
+      sp,
+      /*call=*/std::nullopt,
+      make_capture_callback(&capture),
+      ChatTemplateGenerationMode::UNKNOWN);
+  EXPECT_EQ(request, nullptr);
+  ASSERT_TRUE(capture.status.has_value());
+  EXPECT_EQ(capture.status->code(), StatusCode::INVALID_ARGUMENT);
+  EXPECT_EQ(rate_limiter_.get_num_concurrent_requests(), 0);
+}
+
+TEST_F(LLMRequestFactoryTest, GraphAwareRejectsJsonBeforeExecution) {
+  options_.adaptive_speculative_cost_model("graph");
+  auto factory = make_factory();
+  CallbackCapture capture;
+  RequestParams sp;
+  sp.temperature = 0.0F;
+  sp.response_format = ResponseFormatType::JSON_OBJECT;
+  auto request = factory->create(
+      /*prompt=*/"hello world",
+      /*prompt_tokens=*/std::nullopt,
+      sp,
+      /*call=*/std::nullopt,
+      make_capture_callback(&capture),
+      ChatTemplateGenerationMode::UNKNOWN);
+  EXPECT_EQ(request, nullptr);
+  ASSERT_TRUE(capture.status.has_value());
+  EXPECT_EQ(capture.status->code(), StatusCode::INVALID_ARGUMENT);
+  EXPECT_EQ(rate_limiter_.get_num_concurrent_requests(), 0);
+}
+
+TEST_F(LLMRequestFactoryTest, GraphAwareRejectsBeamBeforeExecution) {
+  options_.adaptive_speculative_cost_model("graph");
+  auto factory = make_factory();
+  CallbackCapture capture;
+  RequestParams sp;
+  sp.temperature = 0.0F;
+  sp.beam_width = 2;
+  auto request = factory->create(
+      /*prompt=*/"hello world",
+      /*prompt_tokens=*/std::nullopt,
+      sp,
+      /*call=*/std::nullopt,
+      make_capture_callback(&capture),
+      ChatTemplateGenerationMode::UNKNOWN);
+  EXPECT_EQ(request, nullptr);
+  ASSERT_TRUE(capture.status.has_value());
+  EXPECT_EQ(capture.status->code(), StatusCode::INVALID_ARGUMENT);
+  EXPECT_EQ(rate_limiter_.get_num_concurrent_requests(), 0);
+}
+
 TEST_F(LLMRequestFactoryTest, TaskPipelineRejectsJsonObjectBeforeGrammarSetup) {
   options_.enable_task_pipeline(true);
   auto factory = make_factory();

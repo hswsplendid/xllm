@@ -402,6 +402,17 @@ std::shared_ptr<Request> LLMRequestFactory::create(
 
   const size_t best_of = sp.best_of.value_or(sp.n);
   RequestSamplingParam sampling_param = build_sampling_param(sp, best_of);
+  if (options_->adaptive_speculative_cost_model() != "linear" &&
+      (sampling_param.temperature > 0.0F || sampling_param.json_object ||
+       sampling_param.beam_width > 1)) {
+    CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
+                        "Graph-aware DSpark requires greedy sampling without "
+                        "beam search or JSON grammar",
+                        sp.service_request_id,
+                        sp.source_xservice_addr);
+    return nullptr;
+  }
+
   const bool has_constraints = !sp.logit_bias.empty() ||
                                sp.allowed_token_ids.has_value() ||
                                !sp.bad_words.empty();

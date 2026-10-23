@@ -53,6 +53,8 @@ std::string Options::to_string() const {
      << ", enable_adaptive_speculative_decode: "
      << enable_adaptive_speculative_decode()
      << ", adaptive_speculative_min_gain: " << adaptive_speculative_min_gain()
+     << ", adaptive_speculative_cost_model: "
+     << adaptive_speculative_cost_model()
      << ", adaptive_dspark_cost_table: " << adaptive_dspark_cost_table()
      << ", adaptive_dspark_calibration: " << adaptive_dspark_calibration()
      << ", adaptive_dspark_cost_table_output: "

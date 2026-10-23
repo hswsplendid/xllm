@@ -89,6 +89,7 @@ DECLARE_bool(enable_mtp_draft_body_tp1);
 DECLARE_bool(enable_adaptive_speculative_decode);
 
 DECLARE_double(adaptive_speculative_min_gain);
+DECLARE_string(adaptive_speculative_cost_model);
 DECLARE_string(adaptive_dspark_cost_table);
 DECLARE_string(adaptive_dspark_calibration);
 DECLARE_string(adaptive_dspark_cost_table_output);

@@ -69,6 +69,8 @@ class FlashInferBackend(AttentionBackend):
         device: torch.device,
         dtype: torch.dtype,
         kv_cache_storage_head_dim: int = 0,
+        causal: bool = True,
+        max_decode_rows: int = 1,
     ) -> None:
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
@@ -80,9 +82,27 @@ class FlashInferBackend(AttentionBackend):
         self.scale = scale
         self.sliding_window = sliding_window
         self.dtype = dtype
+        self.causal = causal
         self._decode_use_tensor_cores = _should_use_tensor_core_decode(dtype, num_heads, num_kv_heads)
 
-        self._decode_workspace = torch.empty(_WORKSPACE_SIZE, dtype=torch.uint8, device=device)
+        decode_workspace_size = _WORKSPACE_SIZE
+        if self._decode_use_tensor_cores:
+            # FA2 graph planning reserves partial V and logsumexp storage for
+            # padded query tiles, even when the capture input has short KV.
+            # Bound the tiles before any wrapper/graph binds this buffer.
+            properties = torch.cuda.get_device_properties(device)
+            group_size = num_heads // num_kv_heads
+            tile_q = 16 if group_size <= 16 and properties.major >= 8 else 128
+            rows = max(16, ((max_decode_rows + 15) // 16) * 16)
+            query_tiles = rows + (rows * group_size + tile_q - 1) // tile_q
+            split_tiles = 2 * properties.multi_processor_count // num_kv_heads
+            partial_rows = max(query_tiles, split_tiles) * tile_q
+            required_bytes = partial_rows * num_heads * (self._kernel_head_dim + 1) * 4 + 32
+            alignment = 1024 * 1024
+            decode_workspace_size = max(
+                decode_workspace_size, ((required_bytes + alignment - 1) // alignment) * alignment
+            )
+        self._decode_workspace = torch.empty(decode_workspace_size, dtype=torch.uint8, device=device)
         self._decode_wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
             self._decode_workspace,
             "NHD",
@@ -164,7 +184,7 @@ class FlashInferBackend(AttentionBackend):
                 self.num_heads,
                 self.num_kv_heads,
                 self._kernel_head_dim,
-                causal=True,
+                causal=self.causal,
                 sm_scale=self.scale,
                 window_left=window_left,
                 q_data_type=self.dtype,
@@ -179,7 +199,7 @@ class FlashInferBackend(AttentionBackend):
                 self.num_kv_heads,
                 self._kernel_head_dim,
                 self.page_size,
-                causal=True,
+                causal=self.causal,
                 sm_scale=self.scale,
                 window_left=window_left,
                 q_data_type=self.dtype,

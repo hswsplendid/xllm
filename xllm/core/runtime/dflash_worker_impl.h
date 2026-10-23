@@ -32,6 +32,8 @@ limitations under the License.
 
 namespace xllm {
 
+class DSparkGraphState;
+
 namespace dflash_detail {
 
 inline int32_t decode_draft_width(int32_t num_speculative_tokens,
@@ -71,7 +73,7 @@ class DFlashWorkerImpl : public DraftModelSpecWorkerImpl<LlmForwardInput> {
                    const torch::Device& device,
                    const runtime::Options& options);
 
-  ~DFlashWorkerImpl() override = default;
+  ~DFlashWorkerImpl() override;
 
   bool init_model(const std::string& model_weights_path,
                   int32_t random_seed,
@@ -125,6 +127,9 @@ class DFlashWorkerImpl : public DraftModelSpecWorkerImpl<LlmForwardInput> {
                                LlmForwardInput& validate_input);
 
  private:
+  void initialize_graph_state();
+  std::unique_ptr<DSparkGraphState> graph_state_;
+  std::vector<int32_t> graph_prefix_lengths_;
   bool draft_use_block_parallel_rows() const {
     return draft_sas_mode_ == dflash_detail::DSparkSasMode::COMPATIBILITY;
   }

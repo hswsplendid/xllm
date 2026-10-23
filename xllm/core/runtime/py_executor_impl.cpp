@@ -171,6 +171,18 @@ void ensure_xllm_runtime_module() {
 
 }  // namespace
 
+std::vector<DSparkGraphCost> PyExecutorImpl::decode_graph_costs() const {
+  py::gil_scoped_acquire gil;
+  const auto costs = py_executor_.attr("decode_graph_costs")()
+                         .cast<std::vector<std::pair<uint32_t, double>>>();
+  std::vector<DSparkGraphCost> result;
+  result.reserve(costs.size());
+  for (const auto& [rows, milliseconds] : costs) {
+    result.emplace_back(DSparkGraphCost{rows, milliseconds});
+  }
+  return result;
+}
+
 PyExecutorImpl::PyExecutorImpl(CausalLM* model,
                                const ModelArgs& args,
                                const torch::Device& device,
@@ -194,6 +206,8 @@ PyExecutorImpl::PyExecutorImpl(CausalLM* model,
   executor_config["task_type"] = options_.task_type();
   executor_config["max_encoder_cache_size"] = options_.max_encoder_cache_size();
   executor_config["num_speculative_tokens"] = options_.num_speculative_tokens();
+  executor_config["adaptive_speculative_cost_model"] =
+      options_.adaptive_speculative_cost_model();
   executor_config["engine_type"] = SpeculativeConfig::uses_ssm_engine(
                                        options_.draft_model_path().value_or(""),
                                        options_.speculative_algorithm(),

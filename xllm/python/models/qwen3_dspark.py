@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Qwen3 DSpark draft model for the Python NPU executor."""
+"""Qwen3 DSpark draft model for the Python CUDA and NPU executors."""
 
 from __future__ import annotations
 

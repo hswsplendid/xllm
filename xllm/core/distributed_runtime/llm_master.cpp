@@ -201,6 +201,8 @@ LLMMaster::LLMMaster(const Options& options)
         .enable_adaptive_speculative_decode(
             options_.enable_adaptive_speculative_decode())
         .adaptive_speculative_min_gain(options_.adaptive_speculative_min_gain())
+        .adaptive_speculative_cost_model(
+            options_.adaptive_speculative_cost_model())
         .adaptive_dspark_cost_table(options_.adaptive_dspark_cost_table())
         .adaptive_dspark_calibration(options_.adaptive_dspark_calibration());
     if (use_suffix_spec) {

@@ -82,6 +82,14 @@ DEFINE_double(
     "adaptive speculative validation.");
 
 DEFINE_string(
+    adaptive_speculative_cost_model,
+    "linear",
+    "Adaptive verification cost model: linear (existing), graph (startup "
+    "replay costs with frozen calibration), graph_feedback (online medians), "
+    "or graph_shadow (measure decisions but execute full width). CUDA Python "
+    "DSpark Draft5/7, greedy sampling, single GPU only for graph modes.");
+
+DEFINE_string(
     adaptive_dspark_cost_table,
     "",
     "JSON full-step cost table for adaptive DSpark task pipelines: "
@@ -121,6 +129,7 @@ void SpeculativeConfig::from_flags() {
   XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_atb_spec_kernel);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_adaptive_speculative_decode);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(adaptive_speculative_min_gain);
+  XLLM_CONFIG_ASSIGN_FROM_FLAG(adaptive_speculative_cost_model);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(adaptive_dspark_cost_table);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(adaptive_dspark_calibration);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(adaptive_dspark_cost_table_output);
@@ -141,6 +150,7 @@ void SpeculativeConfig::from_json(const JsonReader& json) {
   XLLM_CONFIG_ASSIGN_FROM_JSON(enable_atb_spec_kernel);
   XLLM_CONFIG_ASSIGN_FROM_JSON(enable_adaptive_speculative_decode);
   XLLM_CONFIG_ASSIGN_FROM_JSON(adaptive_speculative_min_gain);
+  XLLM_CONFIG_ASSIGN_FROM_JSON(adaptive_speculative_cost_model);
   XLLM_CONFIG_ASSIGN_FROM_JSON(adaptive_dspark_cost_table);
   XLLM_CONFIG_ASSIGN_FROM_JSON(adaptive_dspark_calibration);
   XLLM_CONFIG_ASSIGN_FROM_JSON(adaptive_dspark_cost_table_output);
@@ -178,6 +188,8 @@ void SpeculativeConfig::append_config_json(
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
       config_json, default_config, adaptive_speculative_min_gain);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
+      config_json, default_config, adaptive_speculative_cost_model);
+  APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
       config_json, default_config, adaptive_dspark_cost_table);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
       config_json, default_config, adaptive_dspark_calibration);
@@ -199,6 +211,20 @@ void SpeculativeConfig::initialize() {
 }
 
 void SpeculativeConfig::validate() const {
+  const std::string& cost_model = adaptive_speculative_cost_model();
+  CHECK(cost_model == "linear" || cost_model == "graph" ||
+        cost_model == "graph_feedback" || cost_model == "graph_shadow")
+      << "Unknown adaptive_speculative_cost_model: " << cost_model;
+  CHECK(cost_model == "linear" ||
+        (enable_adaptive_speculative_decode() &&
+         is_dspark_algorithm(speculative_algorithm()) &&
+         (num_speculative_tokens() == 5 || num_speculative_tokens() == 7) &&
+         draft_sampling_mode() == "greedy" && !enable_atb_spec_kernel() &&
+         adaptive_dspark_cost_table().empty() &&
+         adaptive_dspark_calibration().empty() &&
+         adaptive_dspark_cost_table_output().empty()))
+      << "Graph cost models require adaptive greedy DSpark Draft5/7 without "
+         "ATB verification or task-pipeline calibration options.";
   CHECK(adaptive_dspark_calibration().empty() ||
         (adaptive_dspark_cost_table().empty() &&
          enable_adaptive_speculative_decode() &&

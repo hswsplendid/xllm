@@ -194,6 +194,8 @@ def _create_attention_backend(
             device=device,
             dtype=dtype,
             kv_cache_storage_head_dim=int(config.get("kv_cache_storage_head_dim", 0)),
+            causal=first_attention.causal,
+            max_decode_rows=max_num_reqs if first_attention.causal else 1,
         )
     raise NotImplementedError(f"No attention backend available for device type '{device.type}'")
 
@@ -372,6 +374,11 @@ class ModelExecutor:
             "DFlashDraftModel",
             "DFlash2DraftModel",
         )
+        # Block drafts use non-causal multi-token attention and an externally
+        # supplied embedding. The CUDA decode runner captures q_len=1 token
+        # inputs; select the supported eager draft path before any capture.
+        if current_platform.is_cuda() and self._prepared_block_draft and graph_backend == "cudagraphs":
+            graph_backend = "off"
         prepared_kv_split = int(config.get("kv_split_size", 0)) or cp_size
         dcp_group = distributed.dcp_group(device) if current_platform.is_npu() else None
         dcp_size = dcp_group.size() if dcp_group is not None else 1
@@ -412,10 +419,11 @@ class ModelExecutor:
                 execution_model,
                 self.attention_backend,
                 device,
-                max_seqs_per_batch,
+                max_seqs_per_batch * num_decoding_tokens,
                 int(config["max_position_embeddings"]),
                 dp_size,
                 dp_rank,
+                profile_graph_costs=config.get("adaptive_speculative_cost_model", "linear") != "linear",
             )
         elif graph_backend == "aclgraph":
             if self._prepared_dspark:
@@ -800,6 +808,11 @@ class ModelExecutor:
             or getattr(metadata, "prepared_attention_state", None) is None
         ):
             raise ValueError("adaptive DSpark requires an initialized prepared target ACL graph executor")
+
+    def decode_graph_costs(self) -> list[tuple[int, float]]:
+        if not isinstance(self.decode_graph_runner, DecodeCudaGraphRunner):
+            return []
+        return self.decode_graph_runner.graph_costs()
 
     def bind_kv_caches(self, kv_caches: list[LayerCacheInput]) -> None:
         layer_caches = normalize_layer_caches(kv_caches)

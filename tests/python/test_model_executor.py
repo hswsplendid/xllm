@@ -564,6 +564,7 @@ class TestModelExecutorConstruction:
             128,
             2,
             1,
+            profile_graph_costs=False,
         )
 
     @patch("xllm.python.model_executor.executor._create_attention_backend")
@@ -709,6 +710,8 @@ class TestDecodeCudaGraphDataParallelKeys:
     def test_data_parallel_warmup_uses_local_batch_capacity(self):
         assert _decode_graph_buckets(16, 2) == [1, 2, 4, 8]
         assert _decode_graph_buckets(20, 2) == [1, 2, 4, 8, 16]
+        assert _decode_graph_buckets(3, 1) == [1, 2, 4]
+        assert _decode_graph_buckets(24, 1) == [1, 2, 4, 8, 16, 32]
 
     def test_single_rank_graph_key_reuses_padded_bucket(self):
         runner = self._runner()

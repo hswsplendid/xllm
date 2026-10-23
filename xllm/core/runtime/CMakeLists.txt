@@ -57,6 +57,7 @@ cc_library(
     dflash_worker_impl.h
     dflash2_worker_impl.h
     dspark_worker_impl.h
+    dspark_graph_state.h
     forward_shared_memory_manager.h
     worker_rendezvous.h
   SRCS
@@ -106,6 +107,7 @@ cc_library(
     dflash_worker_impl.cpp
     dflash2_worker_impl.cpp
     dspark_worker_impl.cpp
+    dspark_graph_state.cpp
     forward_shared_memory_manager.cpp
   DEPS
     torch

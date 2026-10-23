@@ -239,6 +239,7 @@ xLLM 使用 gflags 管理服务启动参数。`--model <PATH>` 是唯一必填�
 | `enable_atb_spec_kernel` | `bool` | `false` | 是否使用 ATB speculative kernel。 |
 | `enable_adaptive_speculative_decode` | `bool` | `false` | 开启自适应投机长度。DSpark graph task pipeline 支持 greedy Draft5/7；未提供已保存成本表时，在服务就绪前进行完整推理步的成本标定。限制和示例见[自适应 DSpark](/zh/features/adaptive_dspark/)。 |
 | `adaptive_speculative_min_gain` | `double` | `0.0` | DSpark 改变上一个有效验证预算时，要求的最小预测相对吞吐收益。 |
+| `adaptive_speculative_cost_model` | string | `linear` | 验证成本模型：`linear` 保持现有行为；`graph` 使用 CUDA Graph 实测成本和冻结校准；`graph_feedback` 持续更新中位数反馈；`graph_shadow` 记录决策但执行全宽。Graph 模式仅支持启用自适应的 greedy Python Qwen3 DSpark Draft5/7、单 CUDA GPU、`python_graph_backend=cudagraphs`、最多 128 个请求，且关闭 ATB 验证、task pipeline 和 schedule overlap。运行反馈缺失或过期时使用启动 replay 成本；置信度历史不足时，在执行前选择已预热的全宽路径。 |
 | `adaptive_dspark_calibration` | `string` | `""` | 可选的启动标定 JSON 文件；为空时使用内置默认配置，两种情况都会打印实际生效值。不能与已保存成本表输入同时指定。 |
 | `adaptive_dspark_cost_table` | `string` | `""` | 加载兼容的已保存完整步成本表，跳过启动采样和拟合；支持一维 SPS 和二维加性模型，仍需 graph warmup。 |
 | `adaptive_dspark_cost_table_output` | `string` | `""` | 可选的启动标定结果输出文件，保存为带版本和配置身份的 bundle；为空则只保留在内存，绝不覆盖已有文件。加载已保存表时不能指定输出。 |

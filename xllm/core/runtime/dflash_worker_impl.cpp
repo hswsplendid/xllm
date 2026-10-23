@@ -51,7 +51,11 @@ limitations under the License.
 #include "core/framework/speculative/spec_input_builder.h"
 #include "core/framework/speculative/spec_verify.h"
 #include "core/platform/platform.h"
+#include "core/runtime/dspark_graph_state.h"
 #include "core/runtime/task_execution_pipeline.h"
+#if defined(USE_CUDA)
+#include "core/runtime/py_executor_impl.h"
+#endif
 #include "runtime/llm_worker_impl.h"
 #include "util/json_reader.h"
 #include "util/tensor_helper.h"
@@ -339,6 +343,28 @@ DFlashWorkerImpl::DFlashWorkerImpl(const ParallelArgs& parallel_args,
             return std::make_unique<LLMWorkerImpl>(
                 parallel_args, device, draft_options(options));
           }) {
+  if (options.adaptive_speculative_cost_model() != "linear") {
+    CHECK(Platform::is_cuda() &&
+          ModelConfig::is_python_model_impl(
+              ModelConfig::get_instance().model_impl()) &&
+          SpeculativeConfig::is_dspark_algorithm(
+              options.speculative_algorithm()) &&
+          options.enable_adaptive_speculative_decode() &&
+          options.enable_graph() &&
+          ExecutionConfig::get_instance().python_graph_backend() ==
+              "cudagraphs" &&
+          !options.enable_task_pipeline() &&
+          !options.enable_schedule_overlap() &&
+          parallel_args.world_size() == 1 &&
+          options.max_seqs_per_batch() <= 128 &&
+          (options.num_speculative_tokens() == 5 ||
+           options.num_speculative_tokens() == 7) &&
+          options.draft_sampling_mode() == "greedy")
+        << "Graph-aware verification requires greedy CUDA Python DSpark "
+           "Draft5/7, "
+           "one GPU, CUDA graphs, <=128 requests, and no task "
+           "pipeline/schedule overlap.";
+  }
   // Adaptive per-seq validate pruning. DP is supported: the worker gathers
   // each rank's true validate token count over the DP group before the target
   // forward (see sync_dp_global_token_nums_after_prune).
@@ -361,6 +387,38 @@ DFlashWorkerImpl::DFlashWorkerImpl(const ParallelArgs& parallel_args,
     adaptive_spec_controller_ =
         std::make_unique<AdaptiveSpeculativeController>(options);
   }
+}
+
+DFlashWorkerImpl::~DFlashWorkerImpl() = default;
+
+void DFlashWorkerImpl::initialize_graph_state() {
+  if (graph_state_ != nullptr ||
+      options_.adaptive_speculative_cost_model() == "linear") {
+    return;
+  }
+#if defined(USE_CUDA)
+  CHECK(!target_is_hybrid_recurrent_);
+  CHECK(draft_impl_->has_dspark_confidence_head())
+      << "Graph-aware DSpark requires a calibrated confidence head";
+  PyExecutorImpl* executor = impl_->model_executor()->python_impl();
+  CHECK(executor != nullptr);
+  std::vector<DSparkGraphCost> costs = executor->decode_graph_costs();
+  CHECK(!costs.empty())
+      << "DSpark target graph costs must be captured before decoding";
+  for (const DSparkGraphCost& cost : costs) {
+    LOG(INFO) << "DSpark warmed CUDA graph rows=" << cost.graph_rows
+              << " replay_ms=" << cost.target_time_ms;
+  }
+  graph_state_ = std::make_unique<DSparkGraphState>(
+      std::move(costs),
+      options_.num_speculative_tokens(),
+      options_.max_seqs_per_batch(),
+      options_.adaptive_speculative_min_gain(),
+      options_.adaptive_speculative_cost_model() == "graph_feedback",
+      options_.adaptive_speculative_cost_model() == "graph_shadow");
+#else
+  LOG(FATAL) << "Graph-aware verification requires CUDA.";
+#endif
 }
 
 ::xllm::Status DFlashWorkerImpl::create_task_pipeline(
@@ -715,6 +773,11 @@ std::optional<ForwardOutput> DFlashWorkerImpl::step_prefill(
 
 std::optional<ForwardOutput> DFlashWorkerImpl::step_decode(
     const LlmForwardInput& raw_input) {
+#if defined(USE_CUDA)
+  // Draft heads, verification, confidence transfer and context commit share
+  // the stream synchronized below, including the Python graph hand-off.
+  c10::StreamGuard compute_guard = compute_stream_->set_stream_guard();
+#endif
   LlmForwardInput input = raw_input.clone();
   LlmForwardInput validate_input;
 
@@ -732,6 +795,29 @@ std::optional<ForwardOutput> DFlashWorkerImpl::step_decode(
       << "DFlash decode target state count mismatch";
 
   update_decode_step_input(input, last_states);
+  // Startup uses synthetic requests. Keep their confidence and timing out of
+  // the serving estimator, including the frozen-calibration control group.
+  if (!input.input_params.meta.is_graph_warmup) {
+    initialize_graph_state();
+  }
+  if (graph_state_ != nullptr) {
+    CHECK(input.sampling_params.sampling_mode == SamplingMode::GREEDY)
+        << "Graph-aware verification currently supports greedy requests only";
+    CHECK(input.json_object_states.empty())
+        << "Graph-aware verification does not yet support JSON grammar "
+           "requests";
+    const auto& embedding = input.input_params.embedding;
+    uint32_t max_kv_length = 0;
+    for (int32_t row = 0; row < input.input_params.meta.num_sequences; ++row) {
+      const int32_t kv_length = specBuilder::calc_kv_len(
+          input.input_params.attention.host.kv_seq_lens, row, /*offset=*/0);
+      max_kv_length = std::max(max_kv_length, static_cast<uint32_t>(kv_length));
+    }
+    graph_prefix_lengths_ = graph_state_->begin(embedding.embedding_ids,
+                                                embedding.request_ids,
+                                                max_kv_length,
+                                                *compute_stream_->get_stream());
+  }
   DraftBlock draft_block = run_decode_draft(input, validate_input);
   return run_validate(input, draft_block, validate_input);
 }
@@ -965,10 +1051,19 @@ std::optional<ForwardOutput> DFlashWorkerImpl::run_validate(
   sync_dp_global_token_nums_after_prune(validate_input.input_params,
                                         local_total_val_tokens);
 
+  if (graph_state_ != nullptr) {
+    graph_state_->begin_verify(*compute_stream_->get_stream());
+  }
   ForwardOutput target_output =
       run_worker_no_sync_impl(
           *impl_, validate_input, *prepare_stream_, *compute_stream_)
           .value();
+  if (graph_state_ != nullptr) {
+    // Match the startup graph's target-forward scope. Dense scatter and
+    // rejection depend on the request layout, not the selected graph rows;
+    // include them in the remaining round cost instead of the per-row slope.
+    graph_state_->end_verify(*compute_stream_->get_stream());
+  }
   COUNTER_ADD(speculative_execution_latency_seconds_target,
               target_timer.elapsed_seconds());
 
@@ -1013,9 +1108,16 @@ std::optional<ForwardOutput> DFlashWorkerImpl::run_validate(
   // serialize without a cross-stream wait; the sync below only makes the
   // accepted tokens host-visible for the D2H copy and context-cache write.
   maybe_broadcast_spec_tokens(val_output.next_tokens);
+  if (graph_state_ != nullptr) {
+    c10::StreamGuard stream_guard = compute_stream_->set_stream_guard();
+    graph_state_->stage_confidence(draft_block.confidence_probs);
+  }
   compute_stream_->synchronize();
   val_output.next_tokens = to_cpu_contiguous(val_output.next_tokens);
   write_target_context_to_cache(input, val_output);
+  if (graph_state_ != nullptr) {
+    graph_state_->finish(*compute_stream_->get_stream());
+  }
 
   if (!enable_schedule_overlap() && !driver_ && !dp_driver_) {
     return std::nullopt;
@@ -1383,6 +1485,9 @@ void DFlashWorkerImpl::write_target_context_to_cache(
 std::vector<int32_t> DFlashWorkerImpl::compute_adaptive_prefix_lengths(
     const DraftBlock& draft_block,
     const LlmForwardInput& input) {
+  if (options_.adaptive_speculative_cost_model() != "linear") {
+    return graph_prefix_lengths_;
+  }
   // The current Qwen3.8 GDN spec-verify kernel requires a uniform validation
   // width.  Keep DFlash adaptive pruning off for hybrid targets until the
   // generic varlen builder carries the same recurrent checkpoint contract as
