@@ -1108,6 +1108,7 @@ Status TaskExecutionPipeline::plan_sampling(SpeculativeSlot& slot,
     const auto indices =
         torch::TensorOptions().dtype(torch::kInt32).device(torch::kCPU);
     const uint32_t graph_rows = slot.adaptive->plan.graph_rows;
+    // Selected rows define the sample count; adaptive verification is greedy.
     slot.host_validate_sampling = SamplingParameters();
     slot.host_validate_sampling.selected_token_idxes =
         torch::arange(graph_rows, indices);

@@ -40,15 +40,28 @@ def test_cuda_core_decode_for_small_gqa_groups_or_float32():
 
 
 @pytest.mark.parametrize("rows", [512, 1024])
+@pytest.mark.parametrize("num_heads,num_kv_heads,override", [(32, 8, None), (2, 2, True)])
 @torch.inference_mode()
-def test_large_verification_graph_reserves_split_kv_workspace(rows: int) -> None:
+def test_large_verification_graph_reserves_split_kv_workspace(
+    rows: int, num_heads: int, num_kv_heads: int, override: bool | None
+) -> None:
     device = torch.device("cuda")
-    backend = FlashInferBackend(32, 8, 128, 128**-0.5, -1, device, torch.bfloat16, max_decode_rows=rows)
-    layer = Attention(32, 8, 128, 128**-0.5, -1, 0)
+    backend = FlashInferBackend(
+        num_heads,
+        num_kv_heads,
+        128,
+        128**-0.5,
+        -1,
+        device,
+        torch.bfloat16,
+        max_decode_rows=rows,
+        use_tensor_core_decode=override,
+    )
+    layer = Attention(num_heads, num_kv_heads, 128, 128**-0.5, -1, 0)
     generator = torch.Generator(device=device).manual_seed(20261022)
-    keys = torch.randn(rows, 8, 128, device=device, dtype=torch.bfloat16, generator=generator)
-    values = torch.randn(rows, 8, 128, device=device, dtype=torch.bfloat16, generator=generator)
-    queries = torch.randn(rows, 32, 128, device=device, dtype=torch.bfloat16, generator=generator)
+    keys = torch.randn(rows, num_kv_heads, 128, device=device, dtype=torch.bfloat16, generator=generator)
+    values = torch.randn(rows, num_kv_heads, 128, device=device, dtype=torch.bfloat16, generator=generator)
+    queries = torch.randn(rows, num_heads, 128, device=device, dtype=torch.bfloat16, generator=generator)
     backend.bind_kv_caches([LayerCache(torch.zeros_like(keys).unsqueeze(1), torch.zeros_like(values).unsqueeze(1))])
     metadata = SimpleNamespace(
         is_prefill=False,
@@ -71,7 +84,7 @@ def test_large_verification_graph_reserves_split_kv_workspace(rows: int) -> None
     with torch.cuda.graph(graph, stream=stream):
         actual = backend.execute(queries, keys, values, layer)
     graph.replay()
-    expected = values.repeat_interleave(4, dim=1).reshape(rows, -1)
+    expected = values.repeat_interleave(num_heads // num_kv_heads, dim=1).reshape(rows, -1)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
@@ -146,3 +159,17 @@ def test_block_attention_matches_dense_reference(causal: bool, paged: bool) -> N
         )
         references.append(output.transpose(0, 1).reshape(query.size(0), -1))
     torch.testing.assert_close(actual.float(), torch.cat(references), atol=0.02, rtol=0.02)
+
+
+@pytest.mark.parametrize("override,expected", [(None, False), (False, False), (True, True)])
+def test_mha_decode_precision_choice_is_explicit(override: bool | None, expected: bool) -> None:
+    backend = FlashInferBackend(
+        2, 2, 128, 128**-0.5, 0, torch.device("cuda:0"), torch.bfloat16, use_tensor_core_decode=override
+    )
+    assert backend._decode_use_tensor_cores is expected
+    assert backend._decode_wrapper.use_tensor_cores is expected
+
+
+def test_float32_tensor_core_decode_is_rejected_before_allocation() -> None:
+    with pytest.raises(ValueError, match="requires float16 or bfloat16"):
+        FlashInferBackend(2, 2, 128, 128**-0.5, 0, torch.device("cuda:0"), torch.float32, use_tensor_core_decode=True)
