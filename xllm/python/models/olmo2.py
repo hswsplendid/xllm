@@ -85,6 +85,11 @@ class Olmo2Config:
             rope_parameters = {}
         if not isinstance(rope_parameters, dict):
             raise ValueError("OLMo2 rope_parameters must be an object")
+        # An explicit empty alias must not fall through to another dtype.
+        for name in ("torch_dtype", "dtype"):
+            value = config.get(name)
+            if value is not None and (not isinstance(value, (str, torch.dtype)) or value == ""):
+                raise ValueError(f"OLMo2 {name} must be a non-empty dtype name or torch.dtype")
         cfg = cls(
             hidden_size=hidden,
             n_layers=int(_pick("n_layers", "num_hidden_layers")),
@@ -129,8 +134,15 @@ class Olmo2Config:
             raise ValueError("OLMo2 currently requires unscaled RoPE")
         if rope_parameters:
             # Transformers prefers rope_type, falling back to the legacy type.
-            rope_type = rope_parameters.get("rope_type", rope_parameters.get("type", "default"))
-            if rope_type != "default" or rope_parameters.get("factor") is not None:
+            rope_type = "default"
+            for name in ("type", "rope_type"):
+                value = rope_parameters.get(name)
+                if value is not None:
+                    if not isinstance(value, str):
+                        raise ValueError("OLMo2 RoPE type must be a string")
+                    rope_type = value
+            scaling_fields = ("factor", "short_factor", "long_factor", "original_max_position_embeddings")
+            if rope_type != "default" or any(rope_parameters.get(name) is not None for name in scaling_fields):
                 raise ValueError("OLMo2 currently requires unscaled RoPE")
         if config.get("layers_to_capture") or config.get("rope_scaling_mrope_section") or config.get("mrope_section"):
             raise ValueError("OLMo2 auxiliary hidden capture and mRoPE are not supported")

@@ -153,6 +153,65 @@ def test_native_backend_discovery_for_formal_entrypoint() -> None:
 
 
 @pytest.mark.parametrize(
+    "aliases",
+    [{}, {"type": "default"}, {"rope_type": "default"}, {"type": "longrope", "rope_type": "default"}],
+)
+@pytest.mark.parametrize("field", ["factor", "short_factor", "long_factor", "original_max_position_embeddings"])
+@pytest.mark.parametrize("value", [2, 0, False, "", [], {}])
+def test_nested_rope_scaling_is_rejected(aliases: dict[str, Any], field: str, value: Any) -> None:
+    with pytest.raises(ValueError, match="unscaled RoPE"):
+        Olmo2Config.from_dict(_config(rope_parameters={**aliases, field: value}))
+
+
+@pytest.mark.parametrize("aliases", [{}, {"type": None, "rope_type": None}, {"type": "default", "rope_type": None}])
+def test_null_nested_rope_scaling_is_unspecified(aliases: dict[str, Any]) -> None:
+    parameters = dict.fromkeys(("factor", "short_factor", "long_factor", "original_max_position_embeddings"))
+    parameters.update(aliases)
+    assert Olmo2Config.from_dict(_config(rope_parameters=parameters)) == Olmo2Config.from_dict(_config())
+
+
+@pytest.mark.parametrize("alias", ["type", "rope_type"])
+@pytest.mark.parametrize("value", [0, False, [], {}])
+def test_invalid_rope_type_alias_is_rejected(alias: str, value: Any) -> None:
+    with pytest.raises(ValueError, match="RoPE type must be a string"):
+        Olmo2Config.from_dict(_config(rope_parameters={"rope_type": "default", alias: value}))
+
+
+@pytest.mark.parametrize("alias", ["dtype", "torch_dtype"])
+@pytest.mark.parametrize("other", [None, "float16", "bfloat16", ""])
+@pytest.mark.parametrize("value", ["", 0, False, [], {}])
+def test_invalid_dtype_alias_is_rejected_before_allocation(alias: str, other: Any, value: Any) -> None:
+    other_alias = "torch_dtype" if alias == "dtype" else "dtype"
+    # CUDA is intentional: invalid configuration must fail before allocation.
+    with pytest.raises(ValueError, match="non-empty dtype"):
+        Olmo2ForCausalLM(_config(**{alias: value, other_alias: other, "device": "cuda"}))
+
+
+@pytest.mark.parametrize("aliases", [{}, {"dtype": None}, {"torch_dtype": None}, {"dtype": None, "torch_dtype": None}])
+def test_absent_and_null_dtype_aliases_keep_default(aliases: dict[str, Any]) -> None:
+    config = _config()
+    del config["dtype"]
+    config.update(aliases)
+    assert Olmo2ForCausalLM(config).dtype == torch.bfloat16
+
+
+@pytest.mark.parametrize("alias", ["dtype", "torch_dtype"])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("use_name", [False, True])
+def test_supported_dtype_aliases_allocate_expected_dtype(alias: str, dtype: torch.dtype, use_name: bool) -> None:
+    config = _config(dtype=None, torch_dtype=None)
+    config[alias] = str(dtype).removeprefix("torch.") if use_name else dtype
+    model = Olmo2ForCausalLM(config)
+    assert model.dtype == dtype
+    assert all(parameter.dtype == dtype for parameter in model.parameters())
+
+
+def test_canonical_dtype_overrides_legacy_alias() -> None:
+    model = Olmo2ForCausalLM(_config(dtype="float16", torch_dtype="bfloat16"))
+    assert model.dtype == torch.float16
+
+
+@pytest.mark.parametrize(
     "change,match",
     [
         ({"hidden_size": 15}, "divisible"),
