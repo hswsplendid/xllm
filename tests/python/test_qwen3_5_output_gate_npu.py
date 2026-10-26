@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
+
 import pytest
 import torch
 
@@ -18,9 +20,9 @@ def _assert_close(actual: torch.Tensor, reference: torch.Tensor) -> None:
 
 @pytest.mark.parametrize("fused_qkv,enabled", [(False, False), (False, True), (True, True)])
 @pytest.mark.parametrize("tokens", [1, 5])
-@pytest.mark.parametrize("graph_mode", [False, True])
+@pytest.mark.parametrize("execution_mode", ["no_context", "eager", "warmup", "capture", "capture_with_state"])
 def test_attention_forward_gate_before_projection(
-    monkeypatch: pytest.MonkeyPatch, fused_qkv: bool, enabled: bool, tokens: int, graph_mode: bool
+    monkeypatch: pytest.MonkeyPatch, fused_qkv: bool, enabled: bool, tokens: int, execution_mode: str
 ) -> None:
     """Exercise the real layer forward, with controlled QKV/attention inputs.
 
@@ -76,7 +78,12 @@ def test_attention_forward_gate_before_projection(
         return q, key, value, gate
 
     monkeypatch.setattr(kernels, "split_qkv_rmsnorm_mrope", split_qkv)
-    from xllm.python.model_executor.forward_context import AclGraphExecutionState, ForwardContext, forward_context
+    from xllm.python.model_executor.forward_context import (
+        AclGraphCaptureContext,
+        AclGraphExecutionState,
+        ForwardContext,
+        forward_context,
+    )
 
     saved_gate = gate.clone()
     gate_calls: list[tuple[torch.Tensor, torch.Tensor]] = []
@@ -87,8 +94,16 @@ def test_attention_forward_gate_before_projection(
         return fused_gate(output, value)
 
     monkeypatch.setattr(kernels, "fused_sigmoid_mul", record_fused_gate)
+    graph_mode = execution_mode in ("warmup", "capture", "capture_with_state")
     context = ForwardContext(
-        None, torch.device(device), None, [], execution_state=AclGraphExecutionState({}) if graph_mode else None
+        None,
+        torch.device(device),
+        None,
+        [],
+        execution_state=AclGraphExecutionState({}) if execution_mode in ("warmup", "capture_with_state") else None,
+        acl_graph=AclGraphCaptureContext(torch.npu.current_stream(), [])
+        if execution_mode in ("capture", "capture_with_state")
+        else None,
     )
     expected_input = attention_output
     if enabled:
@@ -97,7 +112,8 @@ def test_attention_forward_gate_before_projection(
             if graph_mode
             else attention_output * torch.sigmoid(gate.reshape(tokens, width))
         )
-    with torch.inference_mode(), forward_context(context):
+    execution_context = nullcontext() if execution_mode == "no_context" else forward_context(context)
+    with torch.inference_mode(), execution_context:
         expected = layer.o_proj(expected_input)
         actual = layer(torch.arange(tokens, device=device), qkv)
     _assert_close(actual, expected)
@@ -107,3 +123,39 @@ def test_attention_forward_gate_before_projection(
         torch.testing.assert_close(gate, torch.sigmoid(saved_gate), rtol=0, atol=0)
     else:
         torch.testing.assert_close(gate, saved_gate, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("interleaved", [False, True])
+def test_output_gate_graph_replay_updates_inputs(interleaved: bool) -> None:
+    from xllm.python.layers.npu.qwen3_5.attention import NpuQwen3_5Attention
+    from xllm.python.model_executor.forward_context import AclGraphCaptureContext, ForwardContext, forward_context
+
+    tokens, heads, head_dim = 8, 12, 256
+    width = heads * head_dim
+    options = dict(device="npu:0", dtype=torch.bfloat16)
+    output = torch.randn(tokens, width, **options)
+    backing = torch.randn(tokens, heads, head_dim * (2 if interleaved else 1), **options)
+    gate = backing[:, :, head_dim:] if interleaved else backing
+    layer = NpuQwen3_5Attention.__new__(NpuQwen3_5Attention)
+    torch.nn.Module.__init__(layer)
+    layer.o_proj = torch.nn.Linear(width, 64, bias=False, **options)
+    stream = torch.npu.Stream()
+    stream.wait_stream(torch.npu.current_stream())
+    context = ForwardContext(None, output.device, None, [], acl_graph=AclGraphCaptureContext(stream, []))
+    with torch.inference_mode(), forward_context(context), torch.npu.stream(stream):
+        for _ in range(3):
+            layer.o_proj(layer._apply_output_gate(output, gate))
+    stream.synchronize()
+    graph = torch.npu.NPUGraph()
+    with torch.inference_mode(), forward_context(context), torch.npu.graph(graph, stream=stream):
+        actual = layer.o_proj(layer._apply_output_gate(output, gate))
+    with torch.inference_mode():
+        for step in range(3):
+            output.fill_(step - 1)
+            gate.fill_(step * 0.25 - 0.5)
+            torch.npu.synchronize()
+            graph.replay()
+            torch.npu.synchronize()
+            expected_gate = (output.float() * torch.sigmoid(gate.float().reshape_as(output))).to(output.dtype)
+            expected = layer.o_proj(expected_gate)
+            _assert_close(actual, expected)

@@ -150,10 +150,9 @@ class NpuQwen3_5Attention(Qwen3_5Attention):
             key.view(num_tokens, self.kv_size),
             value.view(num_tokens, self.kv_size),
         )
-        if context is None or (context.acl_graph is None and context.execution_state is None):
-            # This single-use gate belongs to fused QKV. Keep the original
-            # eager expression inline; captured execution uses the SGL kernel.
-            output = output * torch.sigmoid_(gate.view(num_tokens, self.q_size))
-        else:
+        if context is not None and (context.acl_graph is not None or context.execution_state is not None):
             output = self._apply_output_gate(output, gate)
+        else:
+            # Keep the original eager expression for this single-use QKV gate.
+            output = output * torch.sigmoid_(gate.view(num_tokens, self.q_size))
         return self.o_proj(output)
