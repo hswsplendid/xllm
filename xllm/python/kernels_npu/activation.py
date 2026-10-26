@@ -38,9 +38,9 @@ def _check_output_gate(input: torch.Tensor, gate: torch.Tensor) -> None:
 
 @torch.library.custom_op("xllm_python::fused_sigmoid_mul", mutates_args=())
 def fused_sigmoid_mul(input: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
-    """Apply the SGL Triton gate, adapting attention's optional head dimension."""
+    """Apply a fused Triton gate, adapting an optional head dimension."""
     _check_output_gate(input, gate)
-    from .triton.fused_sigmoid_mul import fused_sigmoid_mul as sgl_fused_sigmoid_mul
+    from .triton.fused_sigmoid_mul import fused_sigmoid_mul as triton_fused_sigmoid_mul
 
     with torch.npu.device(input.device):
         # Triton consumes ND storage; contiguous() alone does not unpack NZ.
@@ -49,7 +49,7 @@ def fused_sigmoid_mul(input: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
             value = torch_npu.npu_format_cast(value, torch_npu.Format.ND)
         if torch_npu.get_npu_format(gate) != torch_npu.Format.ND:
             gate = torch_npu.npu_format_cast(gate, torch_npu.Format.ND)
-        output = sgl_fused_sigmoid_mul(value.reshape(gate.shape), gate)
+        output = triton_fused_sigmoid_mul(value.reshape(gate.shape), gate)
     return output.reshape(input.shape)
 
 

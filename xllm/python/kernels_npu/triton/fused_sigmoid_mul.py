@@ -23,11 +23,8 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""SGL-Kernel-NPU same-shape gate from commit
-6fba476a4c4387fdbb4aec09f0619415b9495f0d.
-
-The Triton kernel and public launch schedule retain the pinned implementation.
-"""
+# Upstream implementation revision: 6fba476a4c4387fdbb4aec09f0619415b9495f0d.
+"""Same-shape sigmoid/multiply fusion with FP32 intermediates."""
 
 from __future__ import annotations
 

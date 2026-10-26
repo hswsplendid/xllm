@@ -179,7 +179,7 @@ def test_interleaved_tile_sizes(heads: int, head_dim: int) -> None:
     _assert_close(kernels.fused_sigmoid_mul(x, gate), x * torch.sigmoid(gate.reshape_as(x)))
 
 
-def test_large_packed_buffer_uses_sgl() -> None:
+def test_large_packed_buffer_uses_final_rounding() -> None:
     x = torch.randn(256, 8192, device="npu", dtype=torch.bfloat16)
     gate = torch.randn_like(x)
     actual = kernels.fused_sigmoid_mul(x, gate)
@@ -197,7 +197,7 @@ def test_internal_storage_format_is_converted_to_nd() -> None:
 
 
 @pytest.mark.parametrize("heads", [4, 8, 16])
-def test_large_strided_gate_uses_sgl(heads: int) -> None:
+def test_large_strided_gate_uses_fp32_intermediates(heads: int) -> None:
     x, gate, _, _ = _case(2048, heads, 256, torch.bfloat16, "interleaved")
     _assert_close(
         kernels.fused_sigmoid_mul(x, gate), (x.float() * torch.sigmoid(gate.float().reshape_as(x))).to(x.dtype)
@@ -207,7 +207,7 @@ def test_large_strided_gate_uses_sgl(heads: int) -> None:
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("tokens", [1, 8, 128, 129, 512, 1024])
 @pytest.mark.parametrize("gate_rank", [2, 3])
-def test_every_gate_batch_calls_sgl(
+def test_every_gate_batch_calls_triton_kernel(
     monkeypatch: pytest.MonkeyPatch, dtype: torch.dtype, tokens: int, gate_rank: int
 ) -> None:
     from xllm.python.kernels_npu.triton import fused_sigmoid_mul as implementation
@@ -222,11 +222,11 @@ def test_every_gate_batch_calls_sgl(
     original = implementation.fused_sigmoid_mul
     calls: list[tuple[torch.Size, torch.Size]] = []
 
-    def record_sgl(value: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    def record_kernel(value: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
         calls.append((value.shape, weight.shape))
         return original(value, weight)
 
-    monkeypatch.setattr(implementation, "fused_sigmoid_mul", record_sgl)
+    monkeypatch.setattr(implementation, "fused_sigmoid_mul", record_kernel)
     actual = kernels.fused_sigmoid_mul(x, gate)
     _assert_close(actual, expected)
     assert calls == [(gate.shape, gate.shape)]
@@ -234,7 +234,7 @@ def test_every_gate_batch_calls_sgl(
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-def test_single_rounding_matches_sgl(dtype: torch.dtype) -> None:
+def test_single_rounding_matches_fp32_reference(dtype: torch.dtype) -> None:
     x = torch.full((1, 1), 3.0, device="npu", dtype=dtype)
     gate = torch.full_like(x, 0.3)
     expected = (x.float() * torch.sigmoid(gate.float())).to(dtype)
