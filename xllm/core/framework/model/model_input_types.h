@@ -518,6 +518,8 @@ struct DSparkAdaptiveGraphInput {
   torch::Tensor columns;
   uint32_t block_size = 0;
   uint32_t draft_width = 7;
+  torch::Tensor linear_state_indices;
+  torch::Tensor accepted_lengths;
 };
 
 namespace detail {
@@ -525,6 +527,8 @@ inline DSparkAdaptiveGraphInput dspark_adaptive_graph_input_to(
     const DSparkAdaptiveGraphInput& input,
     const torch::Device& device) {
   DSparkAdaptiveGraphInput out = input;
+  out.linear_state_indices = safe_to(input.linear_state_indices, device, true);
+  out.accepted_lengths = safe_to(input.accepted_lengths, device, true);
   for (torch::Tensor* tensor : {&out.arena,
                                 &out.control,
                                 &out.anchors,

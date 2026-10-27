@@ -390,7 +390,10 @@ class ModelExecutor:
             )
         dp_rank = int(config.get("dp_rank", 0))
         self.dp_size = dp_size
-        self._prepared_mtp = config.get("model_type") == "glm_moe_dsa_mtp"
+        self._prepared_mtp = config.get("model_type") in ("glm_moe_dsa_mtp", "qwen3_5_mtp")
+        self._prepared_qwen_mtp = config.get("model_type") in ("qwen3_5", "qwen3_5_text", "qwen3_5_mtp") and bool(
+            config.get("enable_task_pipeline", False)
+        )
         self._prepared_block_draft = is_block_draft_model(config)
         self._prepared_dspark = is_dspark_draft_model(config)
         # DSpark drafts and DFlash2 write their own context-KV via the shared
@@ -413,6 +416,7 @@ class ModelExecutor:
             self.attention_backend.supports_prepared_metadata
             and (
                 config.get("model_type") in ("qwen3", "glm_moe_dsa", "glm_moe_dsa_mtp")
+                or self._prepared_qwen_mtp
                 or (self._prepared_block_draft and graph_backend in _DISABLED_GRAPH_BACKENDS)
                 or (self._prepared_dspark and config.get("enable_task_pipeline", False) and graph_backend == "aclgraph")
             )
@@ -783,7 +787,9 @@ class ModelExecutor:
     def prepare_metadata(self, metadata: AttentionMetadata) -> None:
         if not self._supports_prepared_metadata or not self._kv_bound:
             raise RuntimeError("prepared metadata requires an initialized supported Qwen3 or GLM executor")
-        if self._prepared_block_draft:
+        if self._prepared_block_draft or (
+            self._prepared_qwen_mtp and not (metadata.is_prefill or metadata.is_chunked_prefill)
+        ):
             metadata.prepared_attention_state = self.attention_backend.prepare_metadata(
                 metadata, device_kv_lengths=True
             )

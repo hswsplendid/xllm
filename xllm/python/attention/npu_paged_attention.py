@@ -501,6 +501,8 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
             if not widths or widths[0] <= 0 or any(width != widths[0] for width in widths):
                 raise ValueError("block draft queries must have a fixed positive width")
             kv_capacity = ((max(actual_seq_kv, default=0) + self.page_size - 1) // self.page_size) * self.page_size
+            if not (metadata.is_prefill or metadata.is_chunked_prefill):
+                kv_capacity = block_table.shape[1] * self.page_size
             if kv_capacity == 0 or kv_capacity > block_table.shape[1] * self.page_size:
                 raise ValueError("prepared block attention exceeds block-table capacity")
             return _PreparedPagedAttention(
@@ -579,7 +581,13 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
                 workspace_kv_length = None
                 if prepared.device_kv_lengths is not None:
                     workspace_kv_length = prepared.block_table.shape[1] * self.page_size
-                self._prepare_paged_graph(workspace_kv_length=workspace_kv_length)
+                device_decode = prepared.device_kv_lengths is not None and not metadata.is_chunked_prefill
+                if device_decode:
+                    self._actual_seq_q = prepared.query_lengths
+                self._prepare_paged_graph(
+                    workspace_kv_length=workspace_kv_length,
+                    input_layout="BNSD" if device_decode else "TND",
+                )
             return
         self._metadata = metadata
         expanded = resolve_expanded_decode_metadata(metadata, block_size=self.logical_page_size)
@@ -740,7 +748,7 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
             and kv_seq_lens.dtype == torch.int32
         )
 
-    def _prepare_paged_graph(self, *, workspace_kv_length: int | None = None) -> None:
+    def _prepare_paged_graph(self, *, workspace_kv_length: int | None = None, input_layout: str = "TND") -> None:
         if self._block_table_i32 is None:
             raise ValueError("paged graph attention requires a block table")
         graph_batch_size = self._block_table_i32.shape[0]
@@ -754,11 +762,18 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
                 workspace_actual_seq_kv = [workspace_kv_length] * graph_batch_size
             state = PagedAttentionGraphState(
                 workspace=get_execution_workspace(
-                    ("FIA_WORKSPACE", graph_batch_size, tuple(self._actual_seq_q), tuple(workspace_actual_seq_kv)),
+                    (
+                        "FIA_WORKSPACE",
+                        input_layout,
+                        graph_batch_size,
+                        tuple(self._actual_seq_q),
+                        tuple(workspace_actual_seq_kv),
+                    ),
                     lambda: self._allocate_graph_workspace(
                         graph_batch_size,
                         self._block_table_i32,
                         actual_seq_kv=workspace_actual_seq_kv,
+                        input_layout=input_layout,
                     ),
                 ),
                 output=get_execution_buffer(
@@ -797,10 +812,15 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
         block_table: torch.Tensor,
         *,
         actual_seq_kv: list[int] | torch.Tensor | None = None,
+        input_layout: str = "TND",
     ) -> torch.Tensor:
         block_size = self.page_size
         workspace_actual_seq_kv = self._actual_seq_kv if actual_seq_kv is None else actual_seq_kv
-        query_tokens = self._actual_seq_q[-1] if self._actual_seq_q else graph_batch_size
+        query_tokens = (
+            graph_batch_size
+            if input_layout == "BNSD"
+            else (self._actual_seq_q[-1] if self._actual_seq_q else graph_batch_size)
+        )
         dummy_q = torch.empty(
             query_tokens,
             self.num_heads,
@@ -815,13 +835,25 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
             dtype=self.dtype,
             device=self.device,
         )
+        dummy_mask = None
+        if input_layout == "BNSD":
+            dummy_q = dummy_q.unsqueeze(2)
+            dummy_mask = torch.empty(
+                graph_batch_size,
+                1,
+                1,
+                block_table.shape[1] * block_size,
+                dtype=torch.bool,
+                device=self.device,
+            )
         if self._use_fia_v2:
             return torch_npu._npu_fused_infer_attention_score_v2_get_max_workspace(
                 query=dummy_q,
                 key=dummy_kv,
                 value=dummy_kv,
                 block_table=block_table,
-                input_layout="TND",
+                input_layout=input_layout,
+                atten_mask=dummy_mask,
                 block_size=block_size,
                 actual_seq_qlen=self._actual_seq_q,
                 actual_seq_kvlen=workspace_actual_seq_kv,
@@ -836,7 +868,8 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
             key=dummy_kv,
             value=dummy_kv,
             block_table=block_table,
-            input_layout="TND",
+            input_layout=input_layout,
+            atten_mask=dummy_mask,
             block_size=block_size,
             actual_seq_lengths=self._actual_seq_q,
             actual_seq_lengths_kv=workspace_actual_seq_kv,
@@ -2048,6 +2081,8 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
         workspace: torch.Tensor,
         output: torch.Tensor,
         lse: torch.Tensor,
+        atten_mask: torch.Tensor | None = None,
+        input_layout: str = "TND",
     ) -> None:
         # Every mutable argument belongs to the captured entry. A deferred
         # update never resolves parameters through the backend's active state.
@@ -2059,13 +2094,13 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
                 query_rope=None,
                 key_rope=None,
                 pse_shift=None,
-                atten_mask=None,
+                atten_mask=atten_mask,
                 actual_seq_qlen=actual_seq_q,
                 actual_seq_kvlen=actual_seq_kv,
                 block_table=block_table,
                 num_query_heads=self.num_heads,
                 softmax_scale=self.scale,
-                input_layout="TND",
+                input_layout=input_layout,
                 num_key_value_heads=self.num_kv_heads,
                 sparse_mode=_SPARSE_MODE_NONE,
                 block_size=block_size,
@@ -2080,13 +2115,13 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
             k,
             v,
             pse_shift=None,
-            atten_mask=None,
+            atten_mask=atten_mask,
             actual_seq_lengths=actual_seq_q,
             actual_seq_lengths_kv=actual_seq_kv,
             block_table=block_table,
             num_heads=self.num_heads,
             scale=self.scale,
-            input_layout="TND",
+            input_layout=input_layout,
             num_key_value_heads=self.num_kv_heads,
             sparse_mode=_SPARSE_MODE_NONE,
             block_size=block_size,
@@ -2107,7 +2142,67 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
         k_flat = k_cache.view(k_cache.size(0), block_size, -1)
         v_flat = v_cache.view(v_cache.size(0), block_size, -1)
 
+        prepared = getattr(metadata, "prepared_attention_state", None)
+        device_lengths = isinstance(prepared, _PreparedPagedAttention) and prepared.device_kv_lengths is not None
+        mask = None
+        query = q_3d
+        input_layout = "TND"
         graph_context = get_forward_context().acl_graph
+        if device_lengths:
+            # Expanded causal queries contain one token per row. Each row's
+            # exact device length is its causal boundary, including MTP repair
+            # and ragged verification. A captured Host bound cannot supply it.
+            if any(width != 1 for width in prepared.query_lengths):
+                raise ValueError("device-length decode requires one query per expanded row")
+            mask = self._block_attention_masks.get(None)
+            if mask is None:
+                lengths = prepared.device_kv_lengths.view(-1, 1, 1, 1)
+                keys = torch.arange(prepared.kv_capacity, device=lengths.device).view(1, 1, 1, -1)
+                mask = (keys >= lengths).contiguous()
+                self._block_attention_masks[None] = mask
+            query = q_3d.unsqueeze(2)
+            input_layout = "BNSD"
+            if graph_context is None:
+                if self._use_fia_v2:
+                    output, _ = torch.ops.npu.npu_fused_infer_attention_score_v2(
+                        q_3d.unsqueeze(2),
+                        k_flat,
+                        v_flat,
+                        atten_mask=mask,
+                        block_table=prepared.block_table,
+                        actual_seq_qlen=prepared.query_lengths,
+                        actual_seq_kvlen=prepared.actual_seq_kv,
+                        num_query_heads=self.num_heads,
+                        num_key_value_heads=self.num_kv_heads,
+                        softmax_scale=self.scale,
+                        input_layout="BNSD",
+                        block_size=block_size,
+                        sparse_mode=_SPARSE_MODE_NONE,
+                        pre_tokens=2147483647,
+                        next_tokens=2147483647,
+                        return_softmax_lse=False,
+                    )
+                else:
+                    output, _ = torch.ops.npu.npu_fused_infer_attention_score(
+                        q_3d.unsqueeze(2),
+                        k_flat,
+                        v_flat,
+                        atten_mask=mask,
+                        block_table=prepared.block_table,
+                        actual_seq_lengths=prepared.query_lengths,
+                        actual_seq_lengths_kv=prepared.actual_seq_kv,
+                        num_heads=self.num_heads,
+                        num_key_value_heads=self.num_kv_heads,
+                        scale=self.scale,
+                        input_layout="BNSD",
+                        block_size=block_size,
+                        sparse_mode=_SPARSE_MODE_NONE,
+                        pre_tokens=2147483647,
+                        next_tokens=2147483647,
+                        softmax_lse_flag=False,
+                    )
+                return output.reshape(num_tokens, self.num_heads * self.head_dim)
+
         if graph_context is not None:
             state = self._paged_graph_state
             if state is None:
@@ -2116,7 +2211,7 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
             actual_seq_kv = state.kv
             block_table = state.block_table
             workspace = state.workspace
-            output = state.output
+            output = state.output.unsqueeze(2) if device_lengths else state.output
             lse = state.lse
             stream = graph_context.stream
             event = torch.npu.ExternalEvent()
@@ -2125,7 +2220,7 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
             torch.npu.graph_task_group_begin(stream)
             try:
                 self._fia_out(
-                    q_3d,
+                    query,
                     k_flat,
                     v_flat,
                     block_size,
@@ -2135,6 +2230,8 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
                     workspace=workspace,
                     output=output,
                     lse=lse,
+                    atten_mask=mask,
+                    input_layout=input_layout,
                 )
             except Exception:
                 torch.npu.graph_task_group_end(stream)
@@ -2143,7 +2240,7 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
 
             def _update_fia_args() -> None:
                 self._fia_out(
-                    q_3d,
+                    query,
                     k_flat,
                     v_flat,
                     block_size,
@@ -2153,6 +2250,8 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
                     workspace=workspace,
                     output=output,
                     lse=lse,
+                    atten_mask=mask,
+                    input_layout=input_layout,
                 )
 
             graph_context.tasks.append(AclGraphTask(event, handle, _update_fia_args))

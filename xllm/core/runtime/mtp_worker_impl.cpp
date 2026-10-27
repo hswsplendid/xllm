@@ -811,13 +811,19 @@ void MTPWorkerImpl<TargetInput>::retire_legacy_prelaunch() {
 template <typename TargetInput>
 ::xllm::Status MTPWorkerImpl<TargetInput>::create_task_pipeline(
     std::unique_ptr<TaskExecutionPipeline>& output) {
+  const bool hybrid_recurrent =
+      impl_ != nullptr && draft_impl_ != nullptr &&
+      (impl_->context_.get_model_args().model_type() == "qwen3_5" ||
+       impl_->context_.get_model_args().model_type() == "qwen3_5_text") &&
+      draft_impl_->context_.get_model_args().model_type() == "qwen3_5_mtp";
   if (impl_ == nullptr || draft_impl_ == nullptr ||
       options_.num_speculative_tokens() <= 0 ||
-      draft_impl_->context_.get_model_args().model_type() !=
-          "glm_moe_dsa_mtp") {
+      (!hybrid_recurrent &&
+       draft_impl_->context_.get_model_args().model_type() !=
+           "glm_moe_dsa_mtp")) {
     return ::xllm::Status(
         StatusCode::INVALID_ARGUMENT,
-        "MTP task pipeline requires fixed-width GLM DSA Target/Draft models.");
+        "MTP task pipeline requires GLM DSA or Qwen3.5 Target/Draft models.");
   }
   SpeculativeTaskCapacity capacity;
   ::xllm::Status status = impl_->task_capacity(options_, capacity.common);
@@ -833,6 +839,7 @@ template <typename TargetInput>
   capacity.calibration_leader = parallel_args_.rank() == 0;
   capacity.sparse_dsa_target =
       impl_->context_.get_model_args().model_type() == "glm_moe_dsa";
+  capacity.hybrid_recurrent_target = hybrid_recurrent;
   capacity.index_topk = args.index_topk();
   capacity.reuse_topk = args.index_share_for_mtp_iteration();
   capacity.refresh_target_prefix = capacity.num_speculative_tokens > 1;

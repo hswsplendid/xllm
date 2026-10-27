@@ -209,7 +209,8 @@ void TaskExecutionPipeline::check_external_thread() const {
 
 Status TaskExecutionPipeline::validate_input(const LlmForwardInput& source,
                                              const LlmTaskCapacity& capacity,
-                                             bool speculative) {
+                                             bool speculative,
+                                             bool hybrid_recurrent) {
   const auto& params = source.input_params;
   const auto& host = params.attention.host;
   const auto& meta = params.meta;
@@ -223,11 +224,12 @@ Status TaskExecutionPipeline::validate_input(const LlmForwardInput& source,
       !source.json_object_state_snapshots.empty() ||
       !source.json_object_invalid_draft.empty() ||
       !source.json_object_errors.empty() || params.is_spec_verify ||
-      params.prefill_without_cache || !params.linear_state_cache_ops.empty() ||
-      !params.linear_state_validity_mask.empty() ||
+      params.prefill_without_cache ||
+      (!hybrid_recurrent && (!params.linear_state_cache_ops.empty() ||
+                             !params.linear_state_validity_mask.empty())) ||
       !params.multi_block_tables.empty() || params.mtp_topk_state != nullptr ||
-      params.num_accepted_tokens.defined() ||
-      !params.num_accepted_tokens_host.empty() ||
+      (!hybrid_recurrent && (params.num_accepted_tokens.defined() ||
+                             !params.num_accepted_tokens_host.empty())) ||
       embedding.input_embedding.defined() || !copy.swap_blocks.empty() ||
       copy.src_block_indices.defined() || copy.dst_block_indices.defined() ||
       copy.cum_sum.defined() || params.parallel.cp_plan.enabled() ||
@@ -250,19 +252,37 @@ Status TaskExecutionPipeline::validate_input(const LlmForwardInput& source,
   const auto inactive = [](int32_t id) { return id == -1; };
   const auto& linear_ids = embedding.linear_state_ids;
   const auto& linear_indices = embedding.linear_state_indices;
-  if ((!linear_ids.empty() &&
-       (linear_ids.size() != host.q_seq_lens.size() ||
-        !std::all_of(linear_ids.begin(), linear_ids.end(), inactive))) ||
-      (linear_indices.defined() &&
-       (!is_cpu_int_tensor(linear_indices, /*dimensions=*/1) ||
-        linear_indices.numel() !=
-            static_cast<int64_t>(host.q_seq_lens.size()) ||
-        !std::all_of(int_span(linear_indices).begin(),
-                     int_span(linear_indices).end(),
-                     inactive)))) {
+  if (!hybrid_recurrent &&
+      ((!linear_ids.empty() &&
+        (linear_ids.size() != host.q_seq_lens.size() ||
+         !std::all_of(linear_ids.begin(), linear_ids.end(), inactive))) ||
+       (linear_indices.defined() &&
+        (!is_cpu_int_tensor(linear_indices, /*dimensions=*/1) ||
+         linear_indices.numel() !=
+             static_cast<int64_t>(host.q_seq_lens.size()) ||
+         !std::all_of(int_span(linear_indices).begin(),
+                      int_span(linear_indices).end(),
+                      inactive))))) {
     return Status(
         StatusCode::INVALID_ARGUMENT,
         "Task pipeline does not support active linear-attention state.");
+  }
+  if (hybrid_recurrent) {
+    const size_t rows = host.q_seq_lens.size();
+    if (linear_ids.size() != rows ||
+        std::any_of(
+            linear_ids.begin(),
+            linear_ids.end(),
+            [&](int32_t id) { return id < (meta.is_graph_warmup ? 0 : 1); }) ||
+        std::any_of(params.linear_state_cache_ops.begin(),
+                    params.linear_state_cache_ops.end(),
+                    [](const LinearStateCacheOp& op) {
+                      return op.restore_requested || op.is_direct_read();
+                    })) {
+      return invalid(
+          "Hybrid task inputs require live state slots without prefix "
+          "restoration.");
+    }
   }
   const auto& tokens = source.host_token_ids();
   if (!source.transfer_kv_infos.empty() &&
@@ -453,7 +473,11 @@ TaskSubmission TaskExecutionPipeline::submit(const LlmForwardInput& input) {
   }
   const bool speculative = speculative_capacity_ != nullptr;
   if (worker_pipeline_ == nullptr) {
-    const Status status = validate_input(*source, capacity_, speculative);
+    const Status status = validate_input(
+        *source,
+        capacity_,
+        speculative,
+        speculative && speculative_capacity_->hybrid_recurrent_target);
     if (!status.ok()) {
       return TaskSubmission{status, 0};
     }

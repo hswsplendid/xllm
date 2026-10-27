@@ -109,6 +109,7 @@ struct SpeculativeTaskCapacity {
   bool adaptive_target_verify = false;
   bool adaptive_draft_step = false;
   bool sparse_dsa_target = false;
+  bool hybrid_recurrent_target = false;
   double adaptive_min_gain = 0.0;
   // Startup calibration installs identical immutable costs on sampling ranks.
   std::shared_ptr<const SpecCostProfileStore> adaptive_costs;
@@ -237,7 +238,8 @@ class TaskExecutionPipeline final {
   friend class TaskExecutionPipelineInputTest;
   static Status validate_input(const LlmForwardInput& input,
                                const LlmTaskCapacity& capacity,
-                               bool speculative = false);
+                               bool speculative = false,
+                               bool hybrid_recurrent = false);
   static std::vector<int64_t> graph_batch_sizes(
       const LlmTaskCapacity& capacity);
   static uint32_t graph_batch_size(const LlmForwardInput& input,

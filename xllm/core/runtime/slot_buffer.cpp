@@ -2111,6 +2111,9 @@ void SlotBuffer::initialize_mtp_context(SlotBuffer& input,
     state.hidden.select(/*dim=*/1, /*index=*/0).zero_();
     state.hidden.select(/*dim=*/1, /*index=*/1).copy_(view.bootstrap_hidden_);
     state.repair_required.zero_();
+    if (state.accepted_lengths.defined()) {
+      state.accepted_lengths.fill_(1);
+    }
   }
   state.positions.copy_(view.bootstrap_positions_);
   state.kv_seq_lens.copy_(view.bootstrap_kv_lengths_);

@@ -134,8 +134,8 @@ Use the MTP launch above with these settings instead of adaptive draft steps:
 --enable_adaptive_target_verify=true --enable_probabilistic_draft=false
 ```
 
-This path requires ordinary Python GLM DSA ACL graphs, asynchronous scheduling,
-task pipeline and DP=CP=1. Greedy and random targets (including mixed batches)
+This path supports GLM DSA and dense Qwen3.5-family Python targets on NPU,
+with ordinary ACL graphs, asynchronous scheduling, task pipeline and DP=CP=1. Greedy and random targets (including mixed batches)
 reuse the existing ragged verifier; the draft must remain greedy. Sampled
 target IDs reach TP consensus before prefix commitment or context publication.
 Unified MTP graphs and simultaneous adaptive draft steps are rejected before
@@ -375,6 +375,30 @@ fitting or pool different Bcap measurements into one G-only cost. Their zero
 training error only means cell medians were retained; it does not establish a
 serving speedup. Compare TPOT, throughput and output equality against SPS and
 additive modes with the same weights, context, concurrency and graph settings.
+
+### Qwen3.5-family hybrid targets
+
+Dense `qwen3_5` / `qwen3_5_text` targets with their `qwen3_5_mtp` draft support
+Graph-cost verification on NPU. A checkpoint containing `mtp.*` weights can
+supply both `--model` and `--draft_model`, including compatible Qwen3.8-27B
+checkpoints. Separate exported draft weights are not required.
+
+Use the MTP verification settings above with `--enable_prefix_cache=false`,
+`--model_impl=python`, `--npu_kernel_backend=TORCH` and a Graph calibration file.
+Keep `--enable_adaptive_draft_step=false` and
+`--enable_unified_mtp_graph=false`. This adapter supports text generation,
+Draft5/7 and DP=CP=1; it does not admit prefix-state restoration or PD transfer.
+Configure `max_linear_state_cache_slots` for the desired concurrency.
+
+The target's full-attention layers mask against exact device KV lengths. FIA
+graph tasks use each round's conservative Host bounds to avoid scanning the
+model's maximum context; these bounds require no Device readback. Linear
+attention reconstructs each request's verifier prefix inside the graph and
+restores its last accepted checkpoint from request-owned device state. Graph
+padding uses separate scratch rows; startup capture suppresses live-state
+writes. Request changes and shorter verification budgets therefore do not
+reuse stale recurrent indices. These state updates remain on the task stream,
+without copying acceptance lengths to Host between draft and target.
 
 ### Reuse a saved cost table
 

@@ -28,6 +28,7 @@ from xllm.python.layers.npu.qwen3_5.gdn_metadata import (
     GdnStateCache,
     GdnVerifyMetadata,
 )
+from xllm.python.model_executor.dspark_graph_input import DSparkAdaptiveGraphInputs
 
 if TYPE_CHECKING:
     from xllm.python.models.qwen3_5 import Qwen3_5Config
@@ -119,6 +120,9 @@ class Qwen3_5GdnMetadataBuilder:
         device = metadata.slot_mapping.device
         if device != self._device:
             raise ValueError("Qwen3.5 GDN input and state caches must use one device")
+        adaptive = getattr(metadata, "adaptive_verify", None)
+        if adaptive is not None:
+            return self._build_adaptive_verify(adaptive)
         read_indices, write_indices = resolve_linear_state_io_indices(metadata)
         if read_indices is None or write_indices is None:
             raise RuntimeError("Qwen3.5 GDN requires read/write state indices")
@@ -164,6 +168,10 @@ class Qwen3_5GdnMetadataBuilder:
             raise ValueError("Qwen3.5 cumulative query lengths do not match host query lengths")
         if cu_seqlens is None or (cu_seqlens.device.type != "cpu" and not host_query_ends):
             cu_seqlens = torch.tensor(query_ends, dtype=torch.int32, device=device)
+        if cu_seqlens.ndim == 1 and cu_seqlens.numel() == len(query_lengths) and host_query_ends == query_ends[1:]:
+            # Prepared Slots expose B cumulative ends. MegaGdnPrefill uses
+            # the equivalent B+1 boundary vector with a leading zero.
+            cu_seqlens = torch.cat((cu_seqlens.new_zeros(1), cu_seqlens))
         if cu_seqlens.dim() != 1 or cu_seqlens.numel() != len(query_lengths) + 1:
             raise ValueError("Qwen3.5 cu_seqlens must contain B+1 entries")
         if cu_seqlens.device.type == "cpu" and cu_seqlens.tolist() != query_ends:
@@ -225,3 +233,24 @@ class Qwen3_5GdnMetadataBuilder:
             width,
             packed_to_dense,
         )
+
+    def _build_adaptive_verify(self, inputs: DSparkAdaptiveGraphInputs) -> GdnVerifyMetadata:
+        assert self._state_caches is not None
+        width = inputs.draft_width + 1
+        if self._checkpoint_stride != width or inputs.linear_state_indices is None or inputs.accepted_lengths is None:
+            raise ValueError("adaptive Qwen MTP requires a checkpoint for every maximum-width verification row")
+        capacity = inputs.linear_state_indices.numel()
+        active = inputs.control.bitwise_and(0xFFFFFFFF)
+        suppressed = inputs.control >= (1 << 32)
+        rows = torch.arange(capacity, device=inputs.control.device)
+        live = (rows < active) & ~suppressed
+        state_indices = torch.where(live, inputs.linear_state_indices, 0)
+        accepted = torch.where(live, inputs.accepted_lengths, 1)
+        graph_rows = inputs.owners.numel()
+        scratch_rows = capacity * width + torch.arange(graph_rows, device=inputs.control.device)
+        packed_to_dense = torch.where(
+            inputs.owners >= 0,
+            inputs.owners.to(torch.int64) * width + inputs.columns,
+            scratch_rows,
+        )
+        return GdnVerifyMetadata(self._state_caches, state_indices, accepted, width, packed_to_dense, graph_rows)

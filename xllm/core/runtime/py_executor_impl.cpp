@@ -86,7 +86,14 @@ py::object dspark_adaptive_graph_input(const ModelParamsView& params) {
           py::arg("owners") = input.owners,
           py::arg("columns") = input.columns,
           py::arg("block_size") = input.block_size,
-          py::arg("draft_width") = input.draft_width);
+          py::arg("draft_width") = input.draft_width,
+          py::arg("linear_state_indices") =
+              input.linear_state_indices.defined()
+                  ? py::cast(input.linear_state_indices)
+                  : py::none(),
+          py::arg("accepted_lengths") = input.accepted_lengths.defined()
+                                            ? py::cast(input.accepted_lengths)
+                                            : py::none());
 }
 
 void register_xllm_runtime_module(py::module_& m) {
@@ -505,11 +512,13 @@ void PyExecutorImpl::bind_kv_caches(std::vector<KVCache>& kv_caches) {
     kv_bound_ = true;
     kv_layer_count_ = num_layers;
     if (options_.enable_task_pipeline()) {
-      prepared_kv_bindings_.reserve(4 * kv_caches.size());
+      prepared_kv_bindings_.reserve(6 * kv_caches.size());
       for (const auto& kv : kv_caches) {
         prepared_kv_bindings_.emplace_back(kv.get_k_cache());
         prepared_kv_bindings_.emplace_back(kv.get_v_cache());
         prepared_kv_bindings_.emplace_back(kv.get_index_cache());
+        prepared_kv_bindings_.emplace_back(kv.get_conv_cache());
+        prepared_kv_bindings_.emplace_back(kv.get_ssm_cache());
         prepared_kv_bindings_.emplace_back(
             kv.get_indexer_cache_scale().value_or(torch::Tensor()));
       }
@@ -524,6 +533,8 @@ void PyExecutorImpl::bind_kv_caches(std::vector<KVCache>& kv_caches) {
              {kv.get_k_cache(),
               kv.get_v_cache(),
               kv.get_index_cache(),
+              kv.get_conv_cache(),
+              kv.get_ssm_cache(),
               kv.get_indexer_cache_scale().value_or(torch::Tensor())}) {
           const auto& bound = prepared_kv_bindings_[index++];
           CHECK_EQ(current.defined(), bound.defined())

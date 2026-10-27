@@ -203,8 +203,8 @@ class NpuQwen3_5GatedDeltaNet(nn.Module):
 
         def _pad(tensor: torch.Tensor) -> torch.Tensor:
             if metadata.packed_to_dense is not None:
-                dense = tensor.new_zeros((batch_size * width, *tensor.shape[1:]))
-                tensor = dense.index_copy_(0, metadata.packed_to_dense, tensor)
+                dense = tensor.new_zeros((batch_size * width + metadata.packed_padding_rows, *tensor.shape[1:]))
+                tensor = dense.index_copy_(0, metadata.packed_to_dense, tensor)[: batch_size * width]
             return tensor.reshape(batch_size, width, *tensor.shape[1:])
 
         # Match native project_split_inputs: project packed rows first, then
@@ -234,6 +234,8 @@ class NpuQwen3_5GatedDeltaNet(nn.Module):
             )
         output = chunk_outputs[0] if len(chunk_outputs) == 1 else torch.cat(chunk_outputs, dim=0)
         output = output.reshape(batch_size * width, self.value_dim)
+        if metadata.packed_padding_rows:
+            output = torch.cat((output, output.new_zeros((metadata.packed_padding_rows, self.value_dim))))
         if metadata.packed_to_dense is not None:
             output = output.index_select(0, metadata.packed_to_dense)
         return output

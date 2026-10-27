@@ -59,6 +59,8 @@ class GdnVerifyMetadata(GdnMetadata):
     # Packed token -> dense [request, verify position] row. None for uniform
     # batches, which can be reshaped without padding or copying.
     packed_to_dense: torch.Tensor | None
+    # Graph padding scatters to unique scratch rows beyond the live states.
+    packed_padding_rows: int = 0
 
 
 @dataclass(frozen=True, slots=True)

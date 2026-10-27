@@ -35,6 +35,8 @@ class MtpContextTest : public ::testing::Test {
                     device_,
                     context_)
                     .ok());
+    context_->mtp_state_.accepted_lengths = torch::ones(
+        {4}, torch::TensorOptions().device(device_).dtype(torch::kInt32));
     ASSERT_TRUE(
         TaskPipelineTestPeer::context_create(*context_, /*capacity=*/2, first_)
             .ok());
@@ -60,6 +62,7 @@ class MtpContextTest : public ::testing::Test {
     state.positions.copy_(torch::tensor({7, 13}, torch::kInt32));
     state.kv_seq_lens.copy_(torch::tensor({8, 14}, torch::kInt32));
     state.repair_required.copy_(torch::tensor({true, false}, torch::kBool));
+    state.accepted_lengths.copy_(torch::tensor({3, 1}, torch::kInt32));
     state.hidden.copy_(torch::arange(12, torch::kFloat32).reshape({2, 2, 3}));
     TaskPipelineTestPeer::context_publish(binding);
   }
@@ -87,10 +90,10 @@ TEST_F(MtpContextTest, CapacityAndSchemaRejectWithoutReplacingOutput) {
                    .ok());
   EXPECT_EQ(context_.get(), original);
   EXPECT_EQ(TaskPipelineTestPeer::mtp_context_bytes(*context_),
-            4U * (8 + 8 + 2 * 3 * 4 + 4 + 4 + 1));
+            4U * (8 + 8 + 2 * 3 * 4 + 4 + 4 + 1 + 4));
   EXPECT_EQ((first_->host_rows_.nbytes()), 2U * 8);
   EXPECT_EQ(TaskPipelineTestPeer::context_device_bytes(*first_),
-            2U * (8 + 8 + 8 + 2 * 3 * 4 + 4 + 4 + 1 + 16 + 1));
+            2U * (8 + 8 + 8 + 2 * 3 * 4 + 4 + 4 + 1 + 4 + 16 + 1));
   const MtpContextView* binding = first_.get();
   EXPECT_FALSE(
       TaskPipelineTestPeer::context_create(*context_, /*capacity=*/0, first_)
@@ -428,6 +431,11 @@ TEST_F(MtpContextTest, AcceptedPrefixesAdvanceStateEntirelyOnDevice) {
   EXPECT_TRUE(torch::equal(
       first_->state_.hidden.select(1, 0).cpu(),
       torch::tensor({{0., 0., 0.}, {18., 19., 20.}}, torch::kFloat32)));
+  EXPECT_TRUE(
+      torch::equal(first_->state_.accepted_lengths.cpu(), lengths.cpu()));
+  EXPECT_TRUE(
+      torch::equal(context_->mtp_state_.accepted_lengths.slice(0, 1, 3).cpu(),
+                   lengths.cpu()));
   // A partial prefix on the next Task replaces the full-accept repair flag.
   tokens.copy_(
       torch::tensor({{31, 32, -1, -1}, {41, 42, 43, -1}}, torch::kInt64));
@@ -442,6 +450,8 @@ TEST_F(MtpContextTest, AcceptedPrefixesAdvanceStateEntirelyOnDevice) {
   EXPECT_TRUE(torch::equal(first_->state_.positions.cpu(),
                            torch::tensor({9, 19}, torch::kInt32)));
   EXPECT_FALSE(first_->state_.repair_required.cpu().any().item<bool>());
+  EXPECT_TRUE(
+      torch::equal(first_->state_.accepted_lengths.cpu(), lengths.cpu()));
 }
 
 TEST_F(MtpContextTest, ChunkedPrefillPublishesOnlyCompletedRows) {
@@ -606,6 +616,8 @@ TEST_F(MtpContextTest, BootstrapRowsJoinPublishedStateAndSurviveSlotRelease) {
                                /*dim=*/0, /*index=*/1),
                            torch::full({2, 3}, 7, torch::kFloat32)));
   EXPECT_FALSE(first_->state_.repair_required.cpu().any().item<bool>());
+  EXPECT_TRUE(torch::equal(first_->state_.accepted_lengths.cpu(),
+                           torch::tensor({1, 1}, torch::kInt32)));
 }
 
 TEST_F(MtpContextTest, InvalidBootstrapCannotAdmitUnpublishedRows) {

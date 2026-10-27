@@ -26,6 +26,9 @@ class TaskExecutionPipelineInputTest : public ::testing::Test {
                                const LlmTaskCapacity& capacity = {}) {
     return TaskExecutionPipeline::validate_input(input, capacity);
   }
+  static Status validate_hybrid_input(const LlmForwardInput& input) {
+    return TaskExecutionPipeline::validate_input(input, {}, true, true);
+  }
   static uint32_t padded_batch_size(const LlmForwardInput& input,
                                     std::span<const int64_t> sizes) {
     return TaskExecutionPipeline::graph_batch_size(input, sizes);
@@ -66,6 +69,25 @@ LlmForwardInput ordinary_input(
   input.sampling_params.selected_token_idxes =
       torch::tensor({num_tokens - 1}, torch::kInt32);
   return input;
+}
+
+TEST_F(TaskExecutionPipelineInputTest, HybridStateRequiresExplicitAdmission) {
+  auto input = ordinary_input(2, BatchForwardType::DECODE);
+  input.input_params.embedding.linear_state_ids = {1, 2};
+  input.input_params.num_accepted_tokens_host = {1, 3};
+  EXPECT_FALSE(validate_input(input).ok());
+  EXPECT_TRUE(validate_hybrid_input(input).ok());
+  input.input_params.embedding.linear_state_ids = {1};
+  EXPECT_FALSE(validate_hybrid_input(input).ok());
+  input.input_params.embedding.linear_state_ids = {1, 0};
+  EXPECT_FALSE(validate_hybrid_input(input).ok());
+  input.input_params.embedding.linear_state_ids = {1, 2};
+  input.input_params.linear_state_cache_ops.resize(2);
+  input.input_params.linear_state_cache_ops[0].restore_requested = true;
+  EXPECT_FALSE(validate_hybrid_input(input).ok());
+  input.input_params.linear_state_cache_ops[0].restore_requested = false;
+  input.input_params.linear_state_cache_ops[0].restore_src_slot_id = 3;
+  EXPECT_FALSE(validate_hybrid_input(input).ok());
 }
 
 TEST_F(TaskExecutionPipelineInputTest,

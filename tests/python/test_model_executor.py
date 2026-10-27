@@ -2597,7 +2597,7 @@ def test_speculative_target_graph_capacity_expands_validation_tokens(dp_size: in
     assert executor.decode_graph_runner is None
 
 
-@pytest.mark.parametrize("model_type", ["qwen3", "glm_moe_dsa"])
+@pytest.mark.parametrize("model_type", ["qwen3", "glm_moe_dsa", "qwen3_5_text", "qwen3_5_mtp"])
 @pytest.mark.parametrize("dp_size", [1, 2])
 @pytest.mark.parametrize("pipeline", [False, True])
 def test_executor_selects_acl_graph_input_owner(model_type: str, dp_size: int, pipeline: bool) -> None:
@@ -2615,7 +2615,7 @@ def test_executor_selects_acl_graph_input_owner(model_type: str, dp_size: int, p
         "xllm.python.model_executor.executor._create_attention_backend", return_value=_PreparedStubAttentionBackend()
     ):
         executor = ModelExecutor(_FakeModel(), config, max_seqs_per_batch=4 * dp_size)
-    assert executor.supports_prepared_metadata
+    assert executor.supports_prepared_metadata == (pipeline or model_type in ("qwen3", "glm_moe_dsa"))
     if pipeline:
         assert executor.decode_graph_runner is None
         assert executor.prepared_graph_runner.dp_size == dp_size

@@ -38,6 +38,7 @@ struct MtpContextTensors {
   torch::Tensor positions;
   torch::Tensor kv_seq_lens;
   torch::Tensor repair_required;
+  torch::Tensor accepted_lengths;
 };
 
 // Tensor rows use the existing EMBEDDING block ids. The scheduler owns their
@@ -125,6 +126,8 @@ struct TaskExecutionPipeline::SpeculativeSlot {
     torch::Tensor columns;
     // Dense refresh/state recovery reuses MTP's existing hidden-state buffer.
     torch::Tensor hidden_columns;
+    torch::Tensor linear_state_storage;
+    torch::Tensor host_linear_state_storage;
   };
   struct Draft {
     std::vector<int64_t> graph_batch_sizes;

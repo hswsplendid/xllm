@@ -41,3 +41,5 @@ class DSparkAdaptiveGraphInputs:
     columns: torch.Tensor
     block_size: int
     draft_width: int = 7
+    linear_state_indices: torch.Tensor | None = None
+    accepted_lengths: torch.Tensor | None = None

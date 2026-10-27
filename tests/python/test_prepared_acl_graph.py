@@ -376,7 +376,7 @@ def test_adaptive_prepared_rejects_non_target_contract(runner: PreparedAclGraphR
         hidden = torch.zeros(8, 4)
     else:
         topk = torch.zeros(8, 1, 2, dtype=torch.int32)
-    with pytest.raises(ValueError, match="ordinary MLA target graph"):
+    with pytest.raises(ValueError, match="ordinary MLA or recurrent target graph"):
         runner.warmup_prepared(tokens, positions, metadata, hidden, topk, dspark_adaptive=inputs)
     runner._capture.assert_not_called()
     runner.attention_backend.prepare.assert_not_called()
@@ -765,7 +765,10 @@ def test_real_paged_backend_refreshes_captured_lengths_and_isolates_entries(
     cache = torch.empty(4, 128, 2, 64)
     backend.bind_kv_caches([LayerCache(key=cache, value=cache)])
 
-    def _allocate_workspace(batch_size: int, block_table: torch.Tensor, *, actual_seq_kv: list[int]) -> torch.Tensor:
+    def _allocate_workspace(
+        batch_size: int, block_table: torch.Tensor, *, actual_seq_kv: list[int], input_layout: str = "TND"
+    ) -> torch.Tensor:
+        assert input_layout == "TND"
         assert block_table.shape[0] == batch_size
         assert actual_seq_kv == [1] * batch_size
         return torch.empty(1)

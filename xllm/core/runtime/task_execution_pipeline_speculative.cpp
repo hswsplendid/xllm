@@ -33,6 +33,7 @@ limitations under the License.
 #include "core/framework/speculative/spec_verify.h"
 #include "core/framework/speculative/verify_layout.h"
 #include "core/kv_cache/transfer/kv_transfer_completion.h"
+#include "core/layers/common/attention_metadata.h"
 #include "core/runtime/dflash2_worker_impl.h"
 #include "runtime/dspark_worker_impl.h"
 #if defined(USE_NPU)
@@ -105,6 +106,14 @@ void pad_task_parallel(ParallelInput& input, uint32_t rows) {
   }
 }
 
+int64_t kv_page_capacity(const std::vector<KVCache>& caches) {
+  const auto found =
+      std::find_if(caches.begin(), caches.end(), [](const KVCache& cache) {
+        return cache.get_k_cache().defined();
+      });
+  return found == caches.end() ? 0 : found->get_k_cache().size(0);
+}
+
 Status invalid(const char* message) {
   return Status(StatusCode::INVALID_ARGUMENT, message);
 }
@@ -168,7 +177,8 @@ uint64_t state_bytes(const MtpContextTensors& state) {
                              &state.hidden,
                              &state.positions,
                              &state.kv_seq_lens,
-                             &state.repair_required}) {
+                             &state.repair_required,
+                             &state.accepted_lengths}) {
     if (tensor->defined()) {
       bytes += tensor->nbytes();
     }
@@ -322,7 +332,8 @@ Status TaskExecutionPipeline::create(
         capacity.kind != SpeculativeTaskKind::MTP) ||
        (capacity.num_speculative_tokens != 5 &&
         capacity.num_speculative_tokens != 7) ||
-       !capacity.sparse_dsa_target || !common.enable_mla ||
+       (!capacity.hybrid_recurrent_target &&
+        (!capacity.sparse_dsa_target || !common.enable_mla)) ||
        common.max_graph_batch_size == 0 || common.model.max_sequences > 128 ||
        capacity.is_probabilistic_draft ||
        !std::isfinite(capacity.adaptive_min_gain) ||
@@ -333,9 +344,16 @@ Status TaskExecutionPipeline::create(
         (common.dp_size != 1 || common.cp_sampling_group != nullptr ||
          capacity.unified_graph || !capacity.refresh_target_prefix)))) {
     return invalid(
-        "Adaptive task pipeline requires NPU MTP/DSpark Draft5/7, sparse DSA "
-        "Target graphs, greedy draft sampling and supported "
+        "Adaptive task pipeline requires NPU MTP/DSpark Draft5/7, DSA or "
+        "Qwen3.5 Target graphs, greedy draft sampling and supported "
         "request/page capacity.");
+  }
+  if (capacity.hybrid_recurrent_target &&
+      (!Platform::is_npu() || capacity.kind != SpeculativeTaskKind::MTP ||
+       !capacity.adaptive_target_verify || common.enable_mla ||
+       common.dp_size != 1 || common.cp_sampling_group != nullptr ||
+       capacity.unified_graph || common.enable_kv_push)) {
+    return invalid("Hybrid MTP requires adaptive NPU graphs with DP=CP=1.");
   }
   if (capacity.adaptive_draft_step &&
       (!Platform::is_npu() || capacity.kind != SpeculativeTaskKind::MTP ||
@@ -376,7 +394,8 @@ Status TaskExecutionPipeline::create(
       common.vocab_size == 0 ||
       (capacity.refresh_target_prefix &&
        capacity.kind != SpeculativeTaskKind::MTP) ||
-      (capacity.kind == SpeculativeTaskKind::MTP && !common.enable_mla) ||
+      (capacity.kind == SpeculativeTaskKind::MTP && !common.enable_mla &&
+       !capacity.hybrid_recurrent_target) ||
       (capacity.kind != SpeculativeTaskKind::MTP &&
        (capacity.context_hidden_size == 0 || capacity.mask_token_id < 0 ||
         static_cast<uint32_t>(capacity.mask_token_id) >= common.vocab_size)) ||
@@ -439,6 +458,10 @@ Status TaskExecutionPipeline::initialize_speculative() {
   captured_graph_batch_sizes_.reserve(graph_batch_sizes_.size());
   const auto options = model_.options();
   const auto pinned = options.device(torch::kCPU).pinned_memory(true);
+  if (speculative_capacity_->hybrid_recurrent_target) {
+    context_->mtp_state_.accepted_lengths =
+        torch::ones({0}, options.dtype(torch::kInt32));
+  }
   if (speculative_capacity_->adaptive_target_verify) {
     adaptive_verify_ = std::make_unique<AdaptiveVerifyState>();
     if (!speculative_capacity_->adaptive_costs) {
@@ -532,6 +555,12 @@ Status TaskExecutionPipeline::initialize_speculative() {
       adaptive.lagged_confidence.reserve(count * (width - 1));
       adaptive.draft_counts.reserve(count);
       adaptive.unified_graph_bindings.reserve(static_cast<size_t>(count) * 4);
+      if (speculative_capacity_->hybrid_recurrent_target) {
+        adaptive.linear_state_storage =
+            torch::zeros({count}, options.dtype(torch::kInt32));
+        adaptive.host_linear_state_storage =
+            torch::zeros({count}, pinned.dtype(torch::kInt32));
+      }
       if (!block_draft()) {
         adaptive.hidden_columns =
             torch::arange(width, options.dtype(torch::kInt64)).view({1, width});
@@ -590,7 +619,7 @@ Status TaskExecutionPipeline::initialize_speculative() {
       spec.kind = block_draft() ? MtpInvocationKind::BLOCK_DRAFT
                                 : MtpInvocationKind::DRAFT;
       spec.draft_step = step;
-      spec.enable_mla = !block_draft();
+      spec.enable_mla = !block_draft() && c.enable_mla;
       spec.mask_token_id =
           block_draft() ? speculative_capacity_->mask_token_id : 0;
       spec.sample_from_anchor =
@@ -950,9 +979,26 @@ Status TaskExecutionPipeline::validate_input(SpeculativeSlot& slot,
   if (!slot.run_models) {
     return Status();
   }
-  if (kv_caches_.empty() || kv_caches_.front().empty() ||
-      draft_->kv_caches.empty() || draft_->kv_caches.front().empty()) {
+  if (kv_page_capacity(kv_caches_) == 0 ||
+      kv_page_capacity(draft_->kv_caches) == 0) {
     return Status(StatusCode::UNAVAILABLE, "MTP requires Target and Draft KV.");
+  }
+  if (speculative_capacity_->hybrid_recurrent_target) {
+    const auto state_cache = std::find_if(
+        kv_caches_.begin(), kv_caches_.end(), [](const KVCache& cache) {
+          return cache.get_conv_cache().defined();
+        });
+    if (state_cache == kv_caches_.end()) {
+      return invalid("Hybrid MTP requires allocated recurrent state.");
+    }
+    const int64_t state_slots = state_cache->get_conv_cache().size(0);
+    const auto& ids = input.input_params.embedding.linear_state_ids;
+    if (std::any_of(ids.begin(), ids.end(), [state_slots](int32_t id) {
+          return id < 0 || id >= state_slots;
+        })) {
+      return invalid(
+          "Hybrid MTP state slot exceeds allocated recurrent cache.");
+    }
   }
   if (count == 0) {
     if (slot.adaptive && slot.decode && c.dp_size > 1) {
@@ -960,9 +1006,8 @@ Status TaskExecutionPipeline::validate_input(SpeculativeSlot& slot,
     }
     return Status();
   }
-  const int64_t blocks =
-      std::min(kv_caches_.front().get_k_cache().size(/*dim=*/0),
-               draft_->kv_caches.front().get_k_cache().size(/*dim=*/0));
+  const int64_t blocks = std::min(kv_page_capacity(kv_caches_),
+                                  kv_page_capacity(draft_->kv_caches));
   if (std::any_of(
           host.block_tables.begin(),
           host.block_tables.end(),
@@ -1258,6 +1303,13 @@ Status TaskExecutionPipeline::plan_adaptive_verify(
         "Adaptive DSpark unified graph requires a prewarmed batch/verify "
         "binding.");
   }
+  VLOG(1) << "Adaptive verification plan: generation=" << generation
+          << " requests=" << slot.rows
+          << " draft_requests=" << physical_requests
+          << " graph_rows=" << plan->graph_rows
+          << " draft_budget=" << plan->draft_budget
+          << " profile=" << profile.has_value()
+          << " calibration=" << adaptive_verify_->calibration_point.has_value();
   adaptive.plan = *plan;
   adaptive.generation = generation;
   adaptive.selected_draft_tokens = plan->draft_budget;
@@ -1522,6 +1574,9 @@ void TaskExecutionPipeline::apply_bootstrap(SpeculativeSlot& slot) {
   slot.state->tokens_.index_copy_(/*dim=*/0, b.rows, b.tokens);
   if (!block_draft()) {
     state.previous_tokens.index_copy_(/*dim=*/0, b.rows, b.tokens);
+    if (state.accepted_lengths.defined()) {
+      state.accepted_lengths.index_fill_(/*dim=*/0, b.rows, /*value=*/1);
+    }
     state.hidden.index_copy_(/*dim=*/0, b.rows, b.state.hidden);
     state.repair_required.index_copy_(
         /*dim=*/0, b.rows, b.state.repair_required);
@@ -1754,6 +1809,10 @@ void TaskExecutionPipeline::bind_adaptive_verify_graph_input(
   input.columns = prefix(adaptive.columns_storage, adaptive.plan.graph_rows);
   input.block_size = capacity_.logical_block_size;
   input.draft_width = speculative_capacity_->num_speculative_tokens;
+  if (speculative_capacity_->hybrid_recurrent_target) {
+    input.linear_state_indices = adaptive.linear_state_storage;
+    input.accepted_lengths = slot.state->storage_.accepted_lengths;
+  }
   slot.validate_input->model_params().graph.dspark_adaptive = std::move(input);
   // B and the startup write mask are Device values, not capture-time scalars.
   // All sources retain their full Slot capacity so a G graph can serve any
@@ -2277,11 +2336,11 @@ Status TaskExecutionPipeline::prepare_speculative(
     slot.adaptive->generation = next_task_id_;
   }
   c10::DeviceGuard guard(device_.unwrap());
-  if (kv_caches_.empty() || kv_caches_.front().empty()) {
+  if (kv_page_capacity(kv_caches_) == 0) {
     return Status(StatusCode::UNAVAILABLE,
                   "MTP embedding resources are not allocated.");
   }
-  const int64_t embedding_rows = kv_caches_.front().get_k_cache().size(0);
+  const int64_t embedding_rows = kv_page_capacity(kv_caches_);
   if (embedding_rows <= 0 ||
       embedding_rows > std::numeric_limits<int32_t>::max()) {
     return invalid("Invalid allocated MTP embedding capacity.");
@@ -2295,6 +2354,10 @@ Status TaskExecutionPipeline::prepare_speculative(
                                 context);
     if (!status.ok()) {
       return status;
+    }
+    if (speculative_capacity_->hybrid_recurrent_target) {
+      context->mtp_state_.accepted_lengths = torch::ones(
+          {embedding_rows}, context->tokens_.options().dtype(torch::kInt32));
     }
     // Views retain the storage object's address, not its allocation contents.
     *context_ = std::move(*context);
@@ -2352,6 +2415,17 @@ Status TaskExecutionPipeline::prepare_speculative(
                                    input.sampling_params.logprobs);
   CHECK(status.ok()) << status.message();
   slot.is_warmup = input.input_params.meta.is_graph_warmup;
+  if (speculative_capacity_->hybrid_recurrent_target) {
+    auto& adaptive = *slot.adaptive;
+    adaptive.host_linear_state_storage.zero_();
+    const auto& ids = input.input_params.embedding.linear_state_ids;
+    std::copy(ids.begin(),
+              ids.end(),
+              adaptive.host_linear_state_storage.data_ptr<int32_t>());
+    copy_input(adaptive.linear_state_storage,
+               adaptive.host_linear_state_storage,
+               prepare_stream_);
+  }
   slot.unified_graph = slot.adaptive
                            ? speculative_capacity_->unified_graph
                            : supports_unified_block_graph(
@@ -2515,6 +2589,15 @@ Status TaskExecutionPipeline::prepare_speculative(
                  sample_views(slot.target_prefill->device_result()),
                  {}};
     auto& target_input = *slot.target_prefill;
+    if (speculative_capacity_->hybrid_recurrent_target) {
+      auto& params = target_input.model_params();
+      params.embedding.linear_state_indices =
+          prefix(slot.adaptive->linear_state_storage, slot.rows);
+      auto guard = prepare_stream_.set_stream_guard();
+      params.attn_metadata->has_initial_states =
+          params.attention.device.kv_seq_lens.gt(
+              params.attention.device.q_seq_lens);
+    }
 
     executor_.prepare_attention_metadata(kv_caches_,
                                          target_input.model_params());
@@ -3488,6 +3571,9 @@ uint64_t TaskExecutionPipeline::speculative_pinned_bytes() const {
     }
     if (slot.adaptive) {
       bytes += slot.adaptive->host_feedback_storage.nbytes();
+      if (slot.adaptive->host_linear_state_storage.defined()) {
+        bytes += slot.adaptive->host_linear_state_storage.nbytes();
+      }
     }
     if (slot.prefix_refresh) {
       bytes += slot.prefix_refresh->input->pinned_bytes();
@@ -3537,7 +3623,8 @@ uint64_t TaskExecutionPipeline::speculative_device_bytes() const {
                                  &slot.adaptive->offsets_storage,
                                  &slot.adaptive->owners_storage,
                                  &slot.adaptive->columns_storage,
-                                 &slot.adaptive->hidden_columns}) {
+                                 &slot.adaptive->hidden_columns,
+                                 &slot.adaptive->linear_state_storage}) {
         bytes += tensor->defined() ? tensor->nbytes() : 0;
       }
     }
@@ -3567,12 +3654,13 @@ const SampleOutput& TaskExecutionPipeline::sample(Sampling& sampling,
 }
 
 namespace {
-constexpr std::array<torch::Tensor MtpContextTensors::*, 5> kContextFields = {
+constexpr std::array<torch::Tensor MtpContextTensors::*, 6> kContextFields = {
     &MtpContextTensors::previous_tokens,
     &MtpContextTensors::hidden,
     &MtpContextTensors::positions,
     &MtpContextTensors::kv_seq_lens,
-    &MtpContextTensors::repair_required};
+    &MtpContextTensors::repair_required,
+    &MtpContextTensors::accepted_lengths};
 }  // namespace
 
 Status TaskExecutionPipeline::create_mtp_context(
@@ -3657,6 +3745,10 @@ Status TaskExecutionPipeline::context_create(
     view.storage_.hidden =
         torch::empty({capacity, 2, context.mtp_state_.hidden.size(/*dim=*/2)},
                      context.mtp_state_.hidden.options());
+    if (context.mtp_state_.accepted_lengths.defined()) {
+      view.storage_.accepted_lengths =
+          torch::ones({capacity}, options.dtype(torch::kInt32));
+    }
     view.storage_.repair_required =
         torch::empty({capacity}, options.dtype(torch::kBool));
     view.mask_storage_ = torch::empty({capacity}, options.dtype(torch::kBool));
@@ -3953,6 +4045,9 @@ void TaskExecutionPipeline::context_advance(
     torch::le_out(view.no_previous_, accepted_lengths, /*other=*/1);
     view.previous_hidden_output_.masked_fill_(view.no_previous_mask_,
                                               /*value=*/0);
+    if (view.state_.accepted_lengths.defined()) {
+      view.state_.accepted_lengths.copy_(accepted_lengths);
+    }
     torch::eq_out(view.state_.repair_required,
                   accepted_lengths,
                   accepted_tokens.size(/*dim=*/1));

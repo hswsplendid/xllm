@@ -22,7 +22,12 @@ import torch.nn as nn
 from scripts.logger import logger
 from xllm.python.attention.backend import AttentionBackend, AttentionMetadata
 from xllm.python.model_executor.dspark_graph_input import DSparkAdaptiveGraphInputs
-from xllm.python.model_executor.forward_context import AclGraphExecutionState, EplbRuntimeState, LayerSynchronizer
+from xllm.python.model_executor.forward_context import (
+    AclGraphExecutionState,
+    EplbRuntimeState,
+    LayerSynchronizer,
+    get_forward_context,
+)
 from xllm.python.model_executor.runners.acl_graph import AclGraphEntry, AclGraphRunner, StaticGraphAttentionMetadata
 from xllm.python.model_executor.runners.base import ModelExecutionOutput
 
@@ -44,7 +49,7 @@ class _PreparedDSparkGraphEntry(AclGraphEntry):
 
 
 def _dspark_graph_tensors(inputs: DSparkAdaptiveGraphInputs) -> tuple[torch.Tensor, ...]:
-    return (
+    tensors = (
         inputs.arena,
         inputs.control,
         inputs.anchors,
@@ -55,6 +60,9 @@ def _dspark_graph_tensors(inputs: DSparkAdaptiveGraphInputs) -> tuple[torch.Tens
         inputs.owners,
         inputs.columns,
     )
+    if inputs.linear_state_indices is not None:
+        tensors += (inputs.linear_state_indices, inputs.accepted_lengths)
+    return tensors
 
 
 class PreparedAclGraphRunner(AclGraphRunner):
@@ -155,6 +163,17 @@ class PreparedAclGraphRunner(AclGraphRunner):
         if not isinstance(inputs.draft_width, int) or inputs.draft_width not in (5, 7):
             raise ValueError("adaptive DSpark draft_width must be 5 or 7")
         capacity = inputs.anchors.numel()
+        if (inputs.linear_state_indices is None) != (inputs.accepted_lengths is None):
+            raise ValueError("adaptive recurrent verification requires state slots and accepted lengths")
+        if inputs.linear_state_indices is not None:
+            for tensor in (inputs.linear_state_indices, inputs.accepted_lengths):
+                if (
+                    tuple(tensor.shape) != (capacity,)
+                    or tensor.dtype != torch.int32
+                    or tensor.device != self.device
+                    or not tensor.is_contiguous()
+                ):
+                    raise ValueError("adaptive recurrent state must use one contiguous int32 row per request capacity")
         graph_rows = input_ids.numel()
         if graph_rows > 128 * (inputs.draft_width + 1):
             raise ValueError("adaptive DSpark graph capacity exceeds the compiled draft-width limit")
@@ -228,11 +247,23 @@ class PreparedAclGraphRunner(AclGraphRunner):
             raise ValueError("prepared ACL graph batch size exceeds capacity or is empty")
         if dspark_adaptive is not None and (
             self._block_draft
-            or not self.attention_backend.is_mla
+            or (
+                not self.attention_backend.is_mla
+                and (
+                    dspark_adaptive.linear_state_indices is None
+                    or getattr(metadata.prepared_attention_state, "device_kv_lengths", None) is None
+                    or not any(
+                        getattr(builder, "supports_linear_spec_verify_graph", False)
+                        for builder in self.execution_metadata_builders
+                    )
+                )
+            )
             or input_embedding is not None
             or mtp_topk_indices is not None
         ):
-            raise ValueError("adaptive DSpark requires an ordinary MLA target graph with token-only inputs")
+            raise ValueError(
+                "adaptive verification requires an ordinary MLA or recurrent target graph with token-only inputs"
+            )
         self._validate_prepared_dp(input_ids, metadata)
         if self._block_draft:
             if metadata.is_prefill or not metadata.is_chunked_prefill or metadata.is_spec_verify:
@@ -358,10 +389,14 @@ class PreparedAclGraphRunner(AclGraphRunner):
             mega_moe_token_mask=mega_moe_token_mask,
             prepared_attention_state=(
                 metadata.prepared_attention_state
-                if getattr(self.attention_backend, "is_mla", False) or self._block_draft
+                if getattr(self.attention_backend, "is_mla", False)
+                or self._block_draft
+                or getattr(metadata.prepared_attention_state, "device_kv_lengths", None) is not None
                 else None
             ),
         )
+        if dspark_adaptive is not None and dspark_adaptive.linear_state_indices is not None:
+            entry.static_metadata.adaptive_verify = dspark_adaptive
         if self._block_draft:
             # Like the legacy DSpark runner, capture at least the startup
             # 16-page context plus the query. Keep the FIA bound constant;
@@ -440,6 +475,13 @@ class PreparedAclGraphRunner(AclGraphRunner):
                 inputs.block_size,
                 inputs.draft_width,
             )
+            if inputs.linear_state_indices is not None:
+                # Packing and recurrent gather indices are graph operations.
+                # Rebuilding only before capture would freeze the first batch's
+                # acceptance lengths and corrupt the next request's state.
+                get_forward_context().layer_shared_cache.update(
+                    self._build_execution_contexts(metadata, entry.static_input_ids)
+                )
         if isinstance(entry, _PreparedBlockGraphEntry):
             table = entry.static_metadata.block_table
             if table.data_ptr() != entry.source_block_table.data_ptr():

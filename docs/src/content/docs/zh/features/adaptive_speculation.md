@@ -121,7 +121,8 @@ Host 仅用 n−2 及更早回收的反馈，以及当前 MTP 服务实测的完
 --enable_adaptive_target_verify=true --enable_probabilistic_draft=false
 ```
 
-此路径要求普通 Python GLM DSA ACL graph、异步调度、task pipeline 和 DP=CP=1。
+此路径支持 NPU 上的 GLM DSA 和 Qwen3.5 系列 dense Python target，要求普通
+ACL graph、异步调度、task pipeline 和 DP=CP=1。
 greedy 或随机 target（包括混合 batch）复用现有 ragged 验证器，draft 必须保持
 greedy。随机 target 的 token 在前缀提交和上下文更新之前先达成 TP 共识。
 unified MTP graph 以及同时开启自适应 draft 步长会在执行前拒绝。启动成本标定
@@ -326,6 +327,24 @@ Graph 表必须声明 `max_kv_length`，并通过带版本及兼容性信息的 
 其训练误差为零仅表示保存了各单元的中位数，不代表真实请求已经获得性能提升；
 应在相同权重、上下文、并发及 Graph 设置下比较 SPS/加性模式与 `graph` 模式的
 TPOT、吞吐和输出一致性。
+
+### Qwen3.5 系列混合注意力模型
+
+NPU Graph 成本感知验证支持 dense `qwen3_5` / `qwen3_5_text` target 及其
+`qwen3_5_mtp` draft。包含 `mtp.*` 权重的 checkpoint 可同时作为 `--model`
+和 `--draft_model`，例如兼容该结构的 Qwen3.8-27B，无需另行导出 draft 权重。
+
+在上述 MTP 验证配置中使用 `--enable_prefix_cache=false`、
+`--model_impl=python`、`--npu_kernel_backend=TORCH` 及 Graph 标定文件，保持
+`--enable_adaptive_draft_step=false` 和 `--enable_unified_mtp_graph=false`。
+该适配支持文本生成、Draft5/7 和 DP=CP=1；不接入前缀状态恢复或 PD 传输。
+按并发需求配置 `max_linear_state_cache_slots`。
+
+普通注意力用设备端真实 KV 长度构造掩码，并按本轮已知的保守 Host 上界更新
+FIA Graph 参数，避免扫描模型最大上下文，也无需回读设备长度。线性注意力在 Graph 内重建各请求的验证
+前缀，并根据请求自有的设备状态恢复上轮接受的 checkpoint。填充行使用独立
+临时空间，启动捕获不写入活动请求状态。更换请求或缩短验证预算时，索引随
+本轮输入更新；draft 与 target 之间不回读接受长度到 Host。
 
 ### 复用已保存成本表
 
