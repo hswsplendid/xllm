@@ -576,6 +576,31 @@ TEST(SpecStartupCalibrationTest, GraphMediansRetainEachPhysicalBinding) {
   EXPECT_EQ(restored->lookup(2, 4097), nullptr);
 }
 
+TEST(SpecStartupCalibrationTest,
+     GraphBundleRejectsMismatchedIdentityAndBounds) {
+  const std::vector<SpecSteadyWindow> windows{window(1, 8, 4.0)};
+  const auto fitted =
+      fit_spec_cost_table(windows, SpecCostModel::Kind::GRAPH, 1800, 4096);
+  ASSERT_TRUE(fitted);
+  auto data = bundle();
+  data["profiles"][0]["min_kv_length"] = 1800;
+  data["profiles"][0]["request_buckets"] = {1};
+  data["profiles"][0]["table"] = nlohmann::json::parse(*fitted);
+  const std::string identity = data["compatibility"].dump();
+  const auto restored = SpecCostTableBundle::from_json(data.dump(), identity);
+  ASSERT_TRUE(restored);
+  EXPECT_NE(restored->lookup(1, 1800), nullptr);
+  EXPECT_NE(restored->lookup(1, 4096), nullptr);
+  EXPECT_EQ(restored->lookup(1, 1799), nullptr);
+  EXPECT_EQ(restored->lookup(1, 4097), nullptr);
+  EXPECT_EQ(restored->lookup(2, 2000), nullptr);
+  data["compatibility"]["model"] = "different-model";
+  EXPECT_FALSE(SpecCostTableBundle::from_json(data.dump(), identity));
+  data["compatibility"] = nlohmann::json::parse(identity);
+  data["profiles"][0]["table"]["max_kv_length"] = 8192;
+  EXPECT_FALSE(SpecCostTableBundle::from_json(data.dump(), identity));
+}
+
 TEST(SpecStartupCalibrationTest, GraphProfilePreservesNonadditiveOptimum) {
   const std::vector<SpecSteadyWindow> windows{window(1, 2, 2),
                                               window(1, 4, 12),

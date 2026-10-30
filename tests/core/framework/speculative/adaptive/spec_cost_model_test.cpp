@@ -214,6 +214,23 @@ TEST(SpecCostModelTest, GraphPreservesBatchInteractionAndNonmonotonicCosts) {
   EXPECT_FALSE(model->step_time_ms(2, 1));
 }
 
+TEST(SpecCostModelTest, GraphKeyRetainsBothFullWidthUnsignedCoordinates) {
+  constexpr uint32_t kMaximum = std::numeric_limits<uint32_t>::max();
+  const nlohmann::json table{{"graph_costs",
+                              {{{"draft_requests", 1},
+                                {"target_graph_rows", kMaximum},
+                                {"step_time_ms", 2.0}},
+                               {{"draft_requests", kMaximum},
+                                {"target_graph_rows", kMaximum},
+                                {"step_time_ms", 3.0}}}},
+                             {"max_kv_length", 4096}};
+  const auto model = SpecCostModel::from_json(table.dump());
+  ASSERT_TRUE(model);
+  EXPECT_DOUBLE_EQ(*model->step_time_ms(1, kMaximum), 2.0);
+  EXPECT_DOUBLE_EQ(*model->step_time_ms(kMaximum, kMaximum), 3.0);
+  EXPECT_FALSE(model->step_time_ms(kMaximum - 1, kMaximum));
+}
+
 TEST(SpecCostModelTest, GraphRejectsMalformedAmbiguousAndDuplicateCells) {
   for (const auto& invalid : std::vector<nlohmann::json>{
            nlohmann::json::array(),
@@ -294,6 +311,29 @@ TEST(SpecCostModelTest, GraphOnlyOffersMeasuredCapturedVerificationBuckets) {
       model->verification_costs(1, 7, std::array<uint32_t, 3>{0, 2, 8}));
   EXPECT_FALSE(model->verification_costs(
       1, std::numeric_limits<uint32_t>::max(), captured));
+}
+
+TEST(SpecCostModelTest, SparseGraphCoverageKeepsFullWidthForBothDraftWidths) {
+  auto table = graph_table();
+  table["graph_costs"].emplace_back(nlohmann::json{
+      {"draft_requests", 2}, {"target_graph_rows", 12}, {"step_time_ms", 7.0}});
+  const auto model = SpecCostModel::from_json(table.dump());
+  ASSERT_TRUE(model);
+  const std::array<uint32_t, 6> captured{1, 2, 4, 8, 12, 16};
+  for (const uint32_t width : {5U, 7U}) {
+    const auto costs = model->verification_costs(2, width, captured);
+    ASSERT_TRUE(costs);
+    EXPECT_EQ(costs->back().graph_rows, 2 * (width + 1));
+    EXPECT_TRUE(
+        std::none_of(costs->begin(), costs->end(), [](const auto& cost) {
+          return cost.graph_rows == 8;
+        }));
+  }
+  table["graph_costs"].erase(table["graph_costs"].end() - 1);
+  const auto missing = SpecCostModel::from_json(table.dump());
+  ASSERT_TRUE(missing);
+  EXPECT_FALSE(missing->verification_costs(2, 5, captured));
+  EXPECT_TRUE(missing->verification_costs(2, 7, captured));
 }
 
 TEST(SpecCostModelTest, LegacyVerificationProfilesKeepExistingCosts) {

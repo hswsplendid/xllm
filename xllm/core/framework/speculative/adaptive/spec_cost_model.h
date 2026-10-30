@@ -17,11 +17,10 @@ limitations under the License.
 
 #include <cstdint>
 #include <limits>
-#include <map>
 #include <optional>
 #include <span>
 #include <string_view>
-#include <utility>
+#include <unordered_map>
 #include <vector>
 
 namespace xllm {
@@ -77,7 +76,9 @@ class SpecCostModel final {
   std::vector<uint32_t> token_probes_;
   // SPS: full step milliseconds. Additive: theta seconds.
   std::vector<double> token_values_;
-  std::map<std::pair<uint32_t, uint32_t>, double> graph_costs_ms_;
+  // Packed (Bcap, G) keys are lookup-only; graph order comes from
+  // captured_graphs.
+  std::unordered_map<uint64_t, double> graph_costs_ms_;
 };
 
 }  // namespace xllm

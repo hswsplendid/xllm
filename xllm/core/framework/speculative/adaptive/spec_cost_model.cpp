@@ -22,6 +22,10 @@ limitations under the License.
 namespace xllm {
 namespace {
 
+uint64_t graph_cost_key(uint32_t requests, uint32_t rows) {
+  return (static_cast<uint64_t>(requests) << 32) | rows;
+}
+
 bool read_index(const nlohmann::json& value, uint32_t& output) {
   if (!value.is_number_integer()) {
     return false;
@@ -140,6 +144,7 @@ std::optional<SpecCostModel> SpecCostModel::from_json(std::string_view text) {
     if (kv_bound == data.end() || !cells.is_array() || cells.empty()) {
       return std::nullopt;
     }
+    model.graph_costs_ms_.reserve(cells.size());
     for (const auto& cell : cells) {
       uint32_t requests = 0;
       uint32_t rows = 0;
@@ -155,7 +160,7 @@ std::optional<SpecCostModel> SpecCostModel::from_json(std::string_view text) {
       if (!std::isfinite(milliseconds) || milliseconds <= 0.0 ||
           !std::isfinite(1000.0 / milliseconds) ||
           !model.graph_costs_ms_
-               .emplace(std::pair{requests, rows}, milliseconds)
+               .emplace(graph_cost_key(requests, rows), milliseconds)
                .second) {
         return std::nullopt;
       }
@@ -227,7 +232,7 @@ std::optional<double> SpecCostModel::step_time_ms(
   }
   if (kind_ == Kind::GRAPH) {
     const auto found =
-        graph_costs_ms_.find({draft_requests, target_graph_rows});
+        graph_costs_ms_.find(graph_cost_key(draft_requests, target_graph_rows));
     return found == graph_costs_ms_.end() ? std::nullopt
                                           : std::optional(found->second);
   }
