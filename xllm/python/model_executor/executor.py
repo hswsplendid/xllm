@@ -462,7 +462,15 @@ class ModelExecutor:
             and config.get("task_type", "generate") == "generate"
             and qwen_mtp_parallel
             and not config.get("enable_adaptive_draft_step", False)
-            and not config.get("enable_adaptive_target_verify", False)
+            and (
+                not config.get("enable_adaptive_target_verify", False)
+                or (
+                    current_platform.is_npu()
+                    and config.get("enable_task_pipeline", False)
+                    and graph_backend == "aclgraph"
+                    and num_decoding_tokens in (6, 8)
+                )
+            )
         )
         prepared_qwen_generation = (
             self._prepared_qwen_gdn
