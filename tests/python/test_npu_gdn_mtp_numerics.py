@@ -22,9 +22,14 @@ it does not use the speculative checkpoint bank to construct expected states.
 from __future__ import annotations
 
 import os
+from types import SimpleNamespace
 
 import pytest
 import torch
+
+from xllm.python.attention.backend import LinearVerifyGraphInputs
+from xllm.python.model_executor.runners.prepared_acl_graph import PreparedAclGraphRunner
+from xllm.python.platform import current_platform
 
 pytest.importorskip("torch_npu", reason="requires the real NPU backend")
 
@@ -110,6 +115,24 @@ def test_mtp_rejected_prefix_matches_single_token_recurrence(draft_width: int, g
     packed_inputs = [value.flatten(0, 1).clone() for value in inputs]
     cu_seqlens = torch.zeros(batch_size + 1, device=device, dtype=torch.int32)
     packed_output = torch.zeros_like(packed_inputs[1])
+    use_varlen = current_platform.get_ascend_soc_generation() == "a3"
+    owners = torch.full((batch_size * width,), -1, device=device, dtype=torch.int32)
+    columns = torch.zeros_like(owners)
+    packed_metadata = SimpleNamespace(
+        control=torch.tensor([batch_size], device=device, dtype=torch.int64),
+        linear_state_indices=indices,
+        num_accepted_tokens=accepted,
+        offsets=cu_seqlens,
+        owners=owners,
+        columns=columns,
+    )
+    dense_graph = LinearVerifyGraphInputs(
+        state_indices=torch.empty_like(indices),
+        num_accepted_tokens=torch.empty_like(accepted),
+        query_width=width,
+        packed_to_dense=torch.zeros(batch_size * width, device=device, dtype=torch.int64),
+        dense_to_packed=torch.zeros(batch_size * width, device=device, dtype=torch.int64),
+    )
 
     def pack_inputs() -> None:
         for source, packed in zip(inputs, packed_inputs):
@@ -117,11 +140,18 @@ def test_mtp_rejected_prefix_matches_single_token_recurrence(draft_width: int, g
             values = torch.cat([source[row, :length] for row, length in enumerate(query_lengths)])
             packed[: values.shape[0]].copy_(values)
         cu_seqlens.copy_(torch.tensor([0, query_lengths[0], sum(query_lengths)], device=device, dtype=torch.int32))
+        owners.fill_(-1)
+        columns.zero_()
+        offset = 0
+        for row, length in enumerate(query_lengths):
+            owners[offset : offset + length].fill_(row)
+            columns[offset : offset + length].copy_(torch.arange(length, device=device, dtype=torch.int32))
+            offset += length
 
     pack_inputs()
 
     def verify() -> torch.Tensor:
-        if ragged:
+        if ragged and use_varlen:
             qkv, z, b, a = packed_inputs
             torch.ops.xllm_ops.mega_gdn_mtp_decode_varlen(
                 qkv,
@@ -142,7 +172,15 @@ def test_mtp_rejected_prefix_matches_single_token_recurrence(draft_width: int, g
             )
             return packed_output
         qkv, z, b, a = inputs
-        return torch.ops.xllm_ops.mega_gdn_mtp_decode(
+        if ragged:
+            PreparedAclGraphRunner._refresh_linear_verify_graph(packed_metadata, dense_graph, batch_size * width)
+            qkv, z, b, a = [
+                torch.cat((value, torch.zeros_like(value[:1])))
+                .index_select(0, dense_graph.dense_to_packed)
+                .view(batch_size, width, *value.shape[1:])
+                for value in packed_inputs
+            ]
+        output = torch.ops.xllm_ops.mega_gdn_mtp_decode(
             qkv,
             z,
             b,
@@ -152,12 +190,24 @@ def test_mtp_rejected_prefix_matches_single_token_recurrence(draft_width: int, g
             a_log,
             dt_bias,
             ssm,
-            indices,
-            indices,
-            accepted,
+            dense_graph.state_indices if ragged else indices,
+            dense_graph.state_indices if ragged else indices,
+            dense_graph.num_accepted_tokens if ragged else accepted,
             norm_weight,
             True,
         )
+        if ragged:
+            output = output.flatten(0, 1)
+            output = torch.cat((output, torch.zeros_like(output[:1]))).index_select(0, dense_graph.packed_to_dense)
+        return output
+
+    if ragged and not use_varlen:
+        live_conv, live_ssm = conv[1:].clone(), ssm[width:].clone()
+        packed_metadata.control.fill_(batch_size | (1 << 32))
+        verify()
+        torch.testing.assert_close(conv[1:], live_conv, rtol=0, atol=0)
+        torch.testing.assert_close(ssm[width:], live_ssm, rtol=0, atol=0)
+        packed_metadata.control.fill_(batch_size)
 
     captured = None
     graph_output = None

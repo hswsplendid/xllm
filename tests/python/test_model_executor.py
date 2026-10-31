@@ -2233,7 +2233,10 @@ def test_executor_accepts_prepared_qwen_hybrid_generation(
 
 @pytest.mark.parametrize("prefill", [False, True])
 @pytest.mark.parametrize("algorithm", ["is_block_diffusion_algorithm", "is_mtp_algorithm"])
-def test_packed_recurrent_target_keeps_request_state_separate_from_token_rows(prefill: bool, algorithm: str) -> None:
+@pytest.mark.parametrize("soc", ["a2", "a3", "a5"])
+def test_packed_recurrent_target_keeps_request_state_separate_from_token_rows(
+    prefill: bool, algorithm: str, soc: str
+) -> None:
     backend = _PreparedStubAttentionBackend()
     config = {
         "model_type": "qwen3_5_text",
@@ -2243,7 +2246,10 @@ def test_packed_recurrent_target_keeps_request_state_separate_from_token_rows(pr
         "enable_adaptive_target_verify": True,
         "python_graph_backend": "aclgraph",
     }
-    with patch("xllm.python.model_executor.executor._create_attention_backend", return_value=backend):
+    with (
+        patch("xllm.python.model_executor.executor._create_attention_backend", return_value=backend),
+        patch("xllm.python.model_executor.executor.current_platform.get_ascend_soc_generation", return_value=soc),
+    ):
         executor = ModelExecutor(_FakeModel(), config, max_seqs_per_batch=2, num_decoding_tokens=8)
     cache = torch.empty(2, 4, 2, 64)
     executor.bind_kv_caches([LayerCache(cache, cache), LayerCache(cache, cache)])
@@ -2264,6 +2270,8 @@ def test_packed_recurrent_target_keeps_request_state_separate_from_token_rows(pr
     assert not executor.prepared_graph_runner._device_kv_lengths
     assert metadata.linear_state_indices.numel() == 2
     assert metadata.prepared_attention_state.device_kv_lengths is not prefill
+
+    assert executor.prepared_graph_runner._varlen_recurrent_verify == (soc == "a3" or algorithm != "is_mtp_algorithm")
 
 
 @pytest.mark.parametrize("draft_tokens", [1, 2, 3, 7, 16])

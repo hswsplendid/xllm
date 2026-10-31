@@ -572,6 +572,13 @@ class ModelExecutor:
                     or self._prepared_qwen_mtp_draft
                     or self._prepared_fixed_recurrent_target,
                     block_draft_graph_warmup_max_kv_len=int(config.get("block_draft_graph_warmup_max_kv_len", 0)),
+                    # The varlen GDN kernel is packaged for A3. Other devices
+                    # retain packed target rows through fixed-kernel maps.
+                    varlen_recurrent_verify=not (
+                        self._prepared_qwen_gdn
+                        and qwen_mtp_requested
+                        and current_platform.get_ascend_soc_generation() != "a3"
+                    ),
                 )
             else:
                 if self._independent_block_draft:
